@@ -10,11 +10,12 @@ import {
 import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
 import {
+  closeChat,
   deleteSession,
   enqueueSystemMessage,
-  flushOutbox,
   getRoom,
   getSession,
+  isChatClosed,
   type GameSession,
   type Seat,
 } from "./store";
@@ -161,8 +162,7 @@ export function maybeTriggerAiEarlyJudge(session: GameSession): void {
   session.aiJudgedAt = Date.now();
   session.aiJudgment = flavorJudgePlayer(session);
   session.responseDeadline = Date.now() + JUDGE_MS;
-  session.finished = true; // lock chat
-  flushOutbox(session);
+  closeChat(session, "opponent_judged");
   pushNotice(
     session,
     `对方已提交判断，请在 ${JUDGE_RESPONSE_SEC} 秒内做出你的判断`,
@@ -342,8 +342,8 @@ export function submitPlayerGuess(
   }
 
   session.myGuess = guess;
-  session.finished = true;
   session.responseDeadline = null;
+  closeChat(session, "player_judged");
 
   if (session.mode === "ai") {
     if (session.aiJudgedAt && session.aiJudgment) {
@@ -372,6 +372,8 @@ export function submitPlayerGuess(
     room.responseDeadline = Date.now() + JUDGE_MS;
     session.waitingForOpponent = true;
     const other: Seat = session.seat === "a" ? "b" : "a";
+    const peer = getSession(room.seats[other]);
+    if (peer) closeChat(peer, "opponent_judged");
     roomNotice(
       session.roomId,
       other,
@@ -386,7 +388,9 @@ export function submitPlayerGuess(
 }
 
 export function chatLocked(session: GameSession): boolean {
-  if (session.finished || session.myGuess || session.timedOut) return true;
+  if (isChatClosed(session) || session.finished || session.myGuess || session.timedOut) {
+    return true;
+  }
   if (session.mode === "ai" && session.aiJudgedAt) return true;
   if (session.mode === "pvp" && session.roomId && session.seat) {
     const room = getRoom(session.roomId);
@@ -396,6 +400,23 @@ export function chatLocked(session: GameSession): boolean {
     if (room?.verdicts[session.seat]) return true;
   }
   return false;
+}
+
+/** Close chat when the wall-clock window ends (idempotent). */
+export function closeChatIfExpired(
+  session: GameSession,
+  startedAt: number,
+  limitSec: number,
+): boolean {
+  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
+    return isChatClosed(session);
+  }
+  if ((Date.now() - startedAt) / 1000 <= limitSec + 5) return false;
+  closeChat(session, "time_limit");
+  if (!session.localNotices.some((n) => n.includes("时间到"))) {
+    pushNotice(session, "时间到，请做出你的判断");
+  }
+  return true;
 }
 
 export function mustJudge(session: GameSession): boolean {

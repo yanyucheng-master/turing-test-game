@@ -9,20 +9,25 @@ import {
   type MatchStatus,
   type FinishResult,
   type EventPullResult,
-  type GuessResult,
 } from "@contracts/types";
 import {
+  closeChat,
   getSession,
   getRoom,
+  isChatClosed,
   peekDueEvents,
   enqueueOpponentMessage,
   type Seat,
 } from "./store";
-import { joinMatch, pollMatch, cancelMatch } from "./matchmaking";
+import {
+  joinMatch,
+  pollMatch,
+  cancelMatch,
+  acceptMatch,
+} from "./matchmaking";
 import { queueAiGeneration } from "./aiWorker";
 import {
   computeStats,
-  truthOf,
   maybeTriggerAiEarlyJudge,
   revealIfReady,
   submitPlayerGuess,
@@ -32,23 +37,9 @@ import {
   waitingMessage,
   waitingDeadline,
   getSettledResult,
+  closeChatIfExpired,
 } from "./settle";
 import { onPlayerActivity, maybeProactiveNudge } from "./proactive";
-
-function emptyGuess(): GuessResult {
-  return {
-    correct: false,
-    timedOut: false,
-    truth: "ai",
-    myGuess: null,
-    opponentGuess: null,
-    opponentTimedOut: false,
-    opponentSource: "llm",
-    playerMessages: 0,
-    opponentMessages: 0,
-    stats: { totalGames: 0, correctRate: 0, aiShare: 0 },
-  };
-}
 
 export const gameRouter = createRouter({
   joinMatch: publicQuery.mutation(async (): Promise<MatchJoinResult> => {
@@ -73,12 +64,24 @@ export const gameRouter = createRouter({
       return { ok: true as const };
     }),
 
+  acceptMatch: publicQuery
+    .input(z.object({ ticketId: z.string(), gameId: z.string() }))
+    .mutation(async ({ input }) => {
+      const ok = acceptMatch(input.ticketId, input.gameId);
+      return { ok };
+    }),
+
   /**
    * Unified chat ACK — identical shape for AI and PvP.
    * Never waits on LLM; never returns opponent reply.
    */
   chat: publicQuery
-    .input(z.object({ gameId: z.string(), text: z.string().min(1).max(500) }))
+    .input(
+      z.object({
+        gameId: z.string(),
+        text: z.string().trim().min(1).max(500),
+      }),
+    )
     .mutation(async ({ input }): Promise<ChatResult> => {
       const session = getSession(input.gameId);
       if (!session) {
@@ -103,16 +106,16 @@ export const gameRouter = createRouter({
         session.mode === "pvp" && session.roomId
           ? (getRoom(session.roomId)?.startedAt ?? session.startedAt)
           : session.startedAt;
-      const elapsed = (Date.now() - startedAt) / 1000;
-      if (elapsed > TIME_LIMIT_SEC + 5) {
-        return { ok: false, expired: true };
+      if (closeChatIfExpired(session, startedAt, TIME_LIMIT_SEC)) {
+        return { ok: false, expired: true, chatLocked: true };
       }
 
       if (session.playerCount >= MAX_PLAYER_MESSAGES) {
-        return { ok: false, limitReached: true };
+        closeChat(session, "message_limit");
+        return { ok: false, limitReached: true, chatLocked: true };
       }
 
-      const text = input.text.trim();
+      const text = input.text;
       session.playerCount += 1;
       onPlayerActivity(session);
 
@@ -127,23 +130,26 @@ export const gameRouter = createRouter({
         }
         room.messages.push({ seat: session.seat, text, at: Date.now() });
         const peer = getSession(room.seats[other]);
-        if (peer) {
+        if (peer && !isChatClosed(peer)) {
           enqueueOpponentMessage(peer, text, Date.now());
           peer.opponentCount += 1;
         }
       } else {
-        // User line is appended inside aiWorker when the turn starts,
-        // so rapid messages stay ordered as u1,a1,u2,a2.
         maybeTriggerAiEarlyJudge(session);
         if (!(session.aiJudgedAt && !session.myGuess)) {
           queueAiGeneration(session, text);
         }
       }
 
+      const limitReached = session.playerCount >= MAX_PLAYER_MESSAGES;
+      if (limitReached) {
+        closeChat(session, "message_limit");
+      }
+
       return {
         ok: true,
         acceptedAt: Date.now(),
-        limitReached: session.playerCount >= MAX_PLAYER_MESSAGES,
+        limitReached,
       };
     }),
 
@@ -205,6 +211,12 @@ export const gameRouter = createRouter({
       maybeTriggerAiEarlyJudge(live);
       maybeProactiveNudge(live);
 
+      const startedAt =
+        live.mode === "pvp" && live.roomId
+          ? (getRoom(live.roomId)?.startedAt ?? live.startedAt)
+          : live.startedAt;
+      const expired = closeChatIfExpired(live, startedAt, TIME_LIMIT_SEC);
+
       const events = peekDueEvents(live, input.cursor);
       const cursor =
         events.length > 0
@@ -221,15 +233,6 @@ export const gameRouter = createRouter({
           message: waitingMessage(),
         };
       }
-
-      const startedAt =
-        live.mode === "pvp" && live.roomId
-          ? (getRoom(live.roomId)?.startedAt ?? live.startedAt)
-          : live.startedAt;
-      const expired =
-        !live.myGuess &&
-        !live.aiJudgedAt &&
-        (Date.now() - startedAt) / 1000 > TIME_LIMIT_SEC + 5;
 
       return {
         ok: true,
@@ -304,16 +307,9 @@ export const gameRouter = createRouter({
         };
       }
 
-      const stats = await computeStats();
       return {
-        phase: "revealed",
-        result: {
-          ...emptyGuess(),
-          stats,
-          truth: truthOf(session.persona, session.opponentSource),
-          myGuess: session.myGuess,
-          opponentSource: session.opponentSource,
-        },
+        phase: "lost",
+        message: "结算状态异常，请重新开始",
       };
     }),
 

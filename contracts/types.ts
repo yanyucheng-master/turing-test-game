@@ -14,8 +14,12 @@ export interface ChatMessageView {
   text: string;
 }
 
-/** Forced matchmaking window. AI arrives at a random time inside this window. */
-export const MATCH_WINDOW_SEC = 10;
+/**
+ * Visible matchmaking window (seconds).
+ * Both human and AI matches reveal inside this window with the same mask delay,
+ * so elapsed time alone cannot fingerprint opponent identity.
+ */
+export const MATCH_WINDOW_SEC = 3;
 
 /** After one side judges, the other must answer within this many seconds. */
 export const JUDGE_RESPONSE_SEC = 20;

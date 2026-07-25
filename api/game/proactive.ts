@@ -1,5 +1,5 @@
 import type { GameSession } from "./store";
-import { enqueueOpponentMessage } from "./store";
+import { enqueueOpponentMessage, isChatClosed } from "./store";
 import { scrubReply } from "./personas";
 import { getSocialPersona } from "./socialPersonas";
 import { INITIAL_CONFIG } from "./config";
@@ -19,7 +19,7 @@ export function scheduleProactiveNudge(
   opts?: { firstContact?: boolean },
 ): void {
   if (session.mode !== "ai") return;
-  if (session.finished || session.myGuess || session.aiJudgedAt) {
+  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
     session.nextNudgeAt = null;
     return;
   }
@@ -84,6 +84,11 @@ export function holdDelayedOpener(
 
 function flushDelayedOpener(session: GameSession): void {
   if (!session.pendingOpener || !session.delayedOpenerAt) return;
+  if (isChatClosed(session)) {
+    session.pendingOpener = null;
+    session.delayedOpenerAt = null;
+    return;
+  }
   if (Date.now() < session.delayedOpenerAt) return;
   if (session.lastPlayerActivityAt > 0) {
     session.pendingOpener = null;
@@ -106,7 +111,12 @@ function flushDelayedOpener(session: GameSession): void {
  */
 export function maybeProactiveNudge(session: GameSession): void {
   if (session.mode !== "ai") return;
-  if (session.finished || session.myGuess || session.aiJudgedAt || session.settled) {
+  if (
+    isChatClosed(session) ||
+    session.myGuess ||
+    session.aiJudgedAt ||
+    session.settled
+  ) {
     return;
   }
 

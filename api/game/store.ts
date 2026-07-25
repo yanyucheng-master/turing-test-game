@@ -58,6 +58,12 @@ export interface OutboxItem {
   deliverAt: number;
 }
 
+export type ChatCloseReason =
+  | "time_limit"
+  | "message_limit"
+  | "player_judged"
+  | "opponent_judged";
+
 export interface GameSession {
   id: string;
   mode: "ai" | "pvp";
@@ -75,6 +81,9 @@ export interface GameSession {
   playerCount: number;
   opponentCount: number;
   finished: boolean;
+  /** Unified chat freeze — stops AI work and undelivered outbox. */
+  chatClosedAt: number | null;
+  chatCloseReason: ChatCloseReason | null;
 
   myGuess: GuessChoice | null;
   timedOut: boolean;
@@ -103,9 +112,41 @@ export interface GameSession {
   lastScheduledDeliveryAt: number;
   /** Prevent overlapping AI generations. */
   aiJobPending: boolean;
-  /** Player lines waiting for AI turn generation. */
+  /**
+   * Combined player text waiting for one AI turn.
+   * User lines are already written to history at accept time.
+   */
   aiReplyQueue: string[];
+  /** Rapid player lines coalesced into one AI turn. */
+  pendingPlayerBurst: string[];
+  burstTimer: ReturnType<typeof setTimeout> | null;
   memory: WorkingMemory;
+}
+
+/** Freeze chat: no more AI jobs, nudges, or undelivered future outbox. */
+export function closeChat(
+  session: GameSession,
+  reason: ChatCloseReason,
+): void {
+  if (session.chatClosedAt) return;
+  const now = Date.now();
+  session.chatClosedAt = now;
+  session.chatCloseReason = reason;
+  session.finished = true;
+  session.aiReplyQueue = [];
+  session.pendingPlayerBurst = [];
+  if (session.burstTimer) {
+    clearTimeout(session.burstTimer);
+    session.burstTimer = null;
+  }
+  session.pendingOpener = null;
+  session.delayedOpenerAt = null;
+  session.nextNudgeAt = null;
+  session.outbox = session.outbox.filter((e) => e.deliverAt <= now);
+}
+
+export function isChatClosed(session: GameSession): boolean {
+  return !!session.chatClosedAt;
 }
 
 const sessions = new Map<string, GameSession>();
@@ -257,6 +298,8 @@ export function createAiSession(
     playerCount: 0,
     opponentCount: 0,
     finished: false,
+    chatClosedAt: null,
+    chatCloseReason: null,
     myGuess: null,
     timedOut: false,
     waitingForOpponent: false,
@@ -280,6 +323,8 @@ export function createAiSession(
     lastScheduledDeliveryAt: 0,
     aiJobPending: false,
     aiReplyQueue: [],
+    pendingPlayerBurst: [],
+    burstTimer: null,
     memory: emptyMemory(),
   };
   if (session.socialPersonaId) {
@@ -327,6 +372,8 @@ export function createPvpPair(
     playerCount: 0,
     opponentCount: 0,
     finished: false,
+    chatClosedAt: null as number | null,
+    chatCloseReason: null as ChatCloseReason | null,
     myGuess: null,
     timedOut: false,
     waitingForOpponent: false,
@@ -350,6 +397,8 @@ export function createPvpPair(
     lastScheduledDeliveryAt: 0,
     aiJobPending: false,
     aiReplyQueue: [] as string[],
+    pendingPlayerBurst: [] as string[],
+    burstTimer: null as ReturnType<typeof setTimeout> | null,
     memory: emptyMemory(),
   };
 

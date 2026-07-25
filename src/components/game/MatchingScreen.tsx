@@ -13,8 +13,8 @@ export default function MatchingScreen({
 }: Props) {
   const windowMs = matchWindowSec * 1000;
   const progress = Math.min(1, elapsedMs / windowMs);
-  const sec = Math.min(matchWindowSec, elapsedMs / 1000);
-  const display = sec.toFixed(1);
+  const sec = Math.min(matchWindowSec, Math.floor(elapsedMs / 1000));
+  const display = sec.toString();
 
   return (
     <div className="min-h-screen bg-[var(--paper)] text-[var(--ink)] font-sans-x flex flex-col">
@@ -43,7 +43,7 @@ export default function MatchingScreen({
               <span className="font-mono-x text-4xl tracking-tight tabular-nums">
                 {display}
                 <span className="text-base text-[var(--faint)] ml-2">
-                  / {matchWindowSec}.0s
+                  / {matchWindowSec}s
                 </span>
               </span>
               <span className="font-mono-x text-[11px] tracking-[0.2em] uppercase text-[var(--faint)] flex items-center gap-2">

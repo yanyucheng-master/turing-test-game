@@ -1,14 +1,48 @@
 import type { GameSession } from "./store";
-import { enqueueOpponentMessage, getSession } from "./store";
+import {
+  enqueueOpponentMessage,
+  getSession,
+  isChatClosed,
+} from "./store";
 import { generateOpponentTurn, generateOpeningTurn } from "./generateTurn";
 import { afterAiReply, holdDelayedOpener } from "./proactive";
 import { fallbackOpener } from "./personas";
+import {
+  getSocialPersona,
+  type PersonaCluster,
+} from "./socialPersonas";
+
+const BURST_MS = 350;
+const OPENER_WAIT_MS = 1_500;
+
+const CLUSTER_OPENERS: Record<PersonaCluster, string[]> = {
+  campus_night: ["嗨", "还没睡啊", "哈喽"],
+  slow_observer: ["嗯你好", "嗨"],
+  tired_worker: ["在", "刚下班"],
+  commute_fragment: ["在", "嗨"],
+  teasing_friend: ["哈喽", "嘿"],
+  cautious_guard: ["你好", "嗨"],
+  high_social: ["哈喽", "终于匹配上了"],
+  cold_low_interest: ["在", "嗯"],
+  creative_procrastinator: ["嗨", "摸鱼吗"],
+  night_shift: ["在", "还醒着"],
+};
+
+function personaOpeningFallback(session: GameSession): string {
+  const persona = getSocialPersona(session.socialPersonaId);
+  const pool = CLUSTER_OPENERS[persona.cluster] ?? ["嗨"];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function delay(ms: number): Promise<null> {
+  return new Promise((resolve) => setTimeout(() => resolve(null), ms));
+}
 
 function pumpQueue(gameId: string): void {
   const session = getSession(gameId);
   if (!session || session.mode !== "ai") return;
   if (session.aiJobPending) return;
-  if (session.finished || session.myGuess || session.aiJudgedAt) {
+  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
     session.aiReplyQueue = [];
     return;
   }
@@ -19,12 +53,14 @@ function pumpQueue(gameId: string): void {
   void (async () => {
     try {
       const live = getSession(gameId);
-      if (!live || live.finished || live.myGuess || live.aiJudgedAt) return;
+      if (!live || isChatClosed(live) || live.myGuess || live.aiJudgedAt) return;
 
-      live.history.push({ role: "user", content: next });
+      // User lines already in history at accept time (real UI order).
       const turn = await generateOpponentTurn(live, next);
       const again = getSession(gameId);
-      if (!again || again.finished || again.myGuess || again.aiJudgedAt) return;
+      if (!again || isChatClosed(again) || again.myGuess || again.aiJudgedAt) {
+        return;
+      }
 
       const now = Date.now();
       for (const d of turn.deliveries) {
@@ -47,21 +83,45 @@ function pumpQueue(gameId: string): void {
   })();
 }
 
+function flushPlayerBurst(gameId: string): void {
+  const session = getSession(gameId);
+  if (!session || session.mode !== "ai") return;
+  session.burstTimer = null;
+  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
+    session.pendingPlayerBurst = [];
+    return;
+  }
+  const burst = session.pendingPlayerBurst.splice(0);
+  if (!burst.length) return;
+  const combined = burst.join("\n");
+  session.aiReplyQueue.push(combined);
+  pumpQueue(gameId);
+}
+
 /**
- * Enqueue player text for AI reply. Never await from chat HTTP handler.
+ * Accept player text: write history immediately, coalesce rapid lines, then
+ * generate one AI reply for the burst.
  */
 export function queueAiGeneration(
   session: GameSession,
   playerText: string,
 ): void {
   if (session.mode !== "ai") return;
-  if (session.finished || session.myGuess || session.aiJudgedAt) return;
-  session.aiReplyQueue.push(playerText);
-  pumpQueue(session.id);
+  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) return;
+
+  session.history.push({ role: "user", content: playerText });
+  session.pendingPlayerBurst.push(playerText);
+
+  if (session.burstTimer) clearTimeout(session.burstTimer);
+  session.burstTimer = setTimeout(
+    () => flushPlayerBurst(session.id),
+    BURST_MS,
+  );
 }
 
 /**
  * Generate opening off the matchmaking hot path.
+ * Cap LLM wait at 1.5s then fall back to persona-local openers.
  */
 export function queueOpeningTurn(
   session: GameSession,
@@ -71,22 +131,23 @@ export function queueOpeningTurn(
   void (async () => {
     try {
       const live = getSession(gameId);
-      if (!live || live.mode !== "ai") return;
-      // Player already spoke — skip opener.
+      if (!live || live.mode !== "ai" || isChatClosed(live)) return;
       if (live.lastPlayerActivityAt > 0 || live.playerCount > 0) return;
 
-      let opener: string;
+      let opener: string | null = null;
       try {
-        opener = await generateOpeningTurn(live);
+        opener = await Promise.race([
+          generateOpeningTurn(live).then((o) => (o?.trim() ? o : null)),
+          delay(OPENER_WAIT_MS),
+        ]);
       } catch {
-        opener = fallbackOpener(live.persona);
+        opener = null;
       }
-      if (!opener.trim()) opener = fallbackOpener(live.persona);
+      if (!opener?.trim()) opener = personaOpeningFallback(live);
 
       const again = getSession(gameId);
-      if (!again || again.lastPlayerActivityAt > 0 || again.playerCount > 0) {
-        return;
-      }
+      if (!again || isChatClosed(again)) return;
+      if (again.lastPlayerActivityAt > 0 || again.playerCount > 0) return;
       if (again.pendingOpener || again.opponentCount > 0) return;
 
       const noticeMs =
@@ -96,6 +157,16 @@ export function queueOpeningTurn(
       holdDelayedOpener(again, opener, noticeMs);
     } catch (err) {
       console.error("[aiWorker] opening failed:", err);
+      const again = getSession(gameId);
+      if (
+        again &&
+        !isChatClosed(again) &&
+        again.playerCount === 0 &&
+        !again.pendingOpener &&
+        again.opponentCount === 0
+      ) {
+        holdDelayedOpener(again, fallbackOpener(again.persona), 400);
+      }
     }
   })();
 }

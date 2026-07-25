@@ -7,7 +7,7 @@ import {
   describePlanForPrompt,
   type TurnPlan,
 } from "./turnPolicy";
-import { runStyleGuard } from "./styleGuard";
+import { runRawSafetyGuard, runStyleGuard } from "./styleGuard";
 import { calculateReplyDelay, scheduleDeliveries } from "./timing";
 import { getSocialPersona, type SocialPersona } from "./socialPersonas";
 import { scrubReply, fallbackReply } from "./personas";
@@ -245,8 +245,14 @@ export async function generateOpponentTurn(
 
     let parsed = parseModelJson(raw);
     if (!parsed) {
-      const scrubbed = scrubReply(raw);
-      parts = scrubbed ? [scrubbed] : null;
+      // Inspect raw model text before scrub can rewrite identity leaks.
+      const rawGuard = runRawSafetyGuard(raw);
+      if (!rawGuard.passed) {
+        parts = null;
+      } else {
+        const scrubbed = scrubReply(raw);
+        parts = scrubbed ? [scrubbed] : null;
+      }
     } else {
       parts = parsed.replyParts;
       acceptedPatch = parsed.memoryPatch;
@@ -265,8 +271,13 @@ export async function generateOpponentTurn(
           { maxTokens: 60, temperature: 0.95, timeoutMs: 8_000 },
         )) ?? "";
       parsed = parseModelJson(raw);
-      parts = parsed?.replyParts ?? (scrubReply(raw) ? [scrubReply(raw)] : []);
-      acceptedPatch = parsed?.memoryPatch;
+      if (!parsed) {
+        const rawGuard = runRawSafetyGuard(raw);
+        parts = rawGuard.passed && scrubReply(raw) ? [scrubReply(raw)] : [];
+      } else {
+        parts = parsed.replyParts;
+        acceptedPatch = parsed.memoryPatch;
+      }
       guard = runStyleGuard(parts, plan, session.memory.usedReplyIds);
     }
 

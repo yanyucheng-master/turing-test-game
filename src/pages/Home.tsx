@@ -38,15 +38,24 @@ export default function Home() {
   const eventCursorRef = useRef(0);
   const matchJoinedAtRef = useRef(0);
   const mustJudgeRef = useRef(false);
+  const chatOverRef = useRef(false);
+
+  const setChatEnded = (value: boolean) => {
+    chatOverRef.current = value;
+    setChatOver(value);
+  };
 
   const joinMut = trpc.game.joinMatch.useMutation();
   const pollMut = trpc.game.pollMatch.useMutation();
   const cancelMut = trpc.game.cancelMatch.useMutation();
+  const acceptMut = trpc.game.acceptMatch.useMutation();
   const chatMut = trpc.game.chat.useMutation();
   const finishMut = trpc.game.finish.useMutation();
   const eventsMut = trpc.game.events.useMutation();
   const pollAsyncRef = useRef(pollMut.mutateAsync);
   pollAsyncRef.current = pollMut.mutateAsync;
+  const acceptAsyncRef = useRef(acceptMut.mutateAsync);
+  acceptAsyncRef.current = acceptMut.mutateAsync;
   const eventsAsyncRef = useRef(eventsMut.mutateAsync);
   eventsAsyncRef.current = eventsMut.mutateAsync;
 
@@ -56,7 +65,7 @@ export default function Home() {
     setMustJudgeMode(false);
     mustJudgeRef.current = false;
     setJudgeDeadlineAt(null);
-    setChatOver(true);
+    setChatEnded(true);
     setPhase("verdict");
     setShowVerdict(true);
   };
@@ -66,7 +75,7 @@ export default function Home() {
     setWaitMessage(message);
     setWaitNow(Date.now());
     setGuessOpen(false);
-    setChatOver(true);
+    setChatEnded(true);
     setPhase("waiting");
   };
 
@@ -74,7 +83,7 @@ export default function Home() {
     setMustJudgeMode(true);
     mustJudgeRef.current = true;
     setJudgeDeadlineAt(deadlineAt);
-    setChatOver(true);
+    setChatEnded(true);
     if (sysMsgs?.length) {
       setMessages((ms) => [...ms, ...sysMsgs]);
     } else {
@@ -97,7 +106,7 @@ export default function Home() {
     setResult(null);
     setShowVerdict(false);
     setSessionLost(false);
-    setChatOver(false);
+    setChatEnded(false);
     setGuessOpen(false);
     setMustJudgeMode(false);
     mustJudgeRef.current = false;
@@ -148,6 +157,15 @@ export default function Home() {
         if (status.status === "searching") {
           setMatchElapsedMs(status.elapsedMs);
         } else if (status.status === "matched") {
+          try {
+            await acceptAsyncRef.current({
+              ticketId,
+              gameId: status.gameId,
+            });
+          } catch {
+            /* still enter — server may accept on first events */
+          }
+          if (stopped) return;
           enterChat(status);
           return;
         }
@@ -164,7 +182,7 @@ export default function Home() {
       if (matchJoinedAtRef.current) {
         setMatchElapsedMs(Date.now() - matchJoinedAtRef.current);
       }
-    }, 100);
+    }, 500);
     return () => {
       stopped = true;
       window.clearTimeout(timer);
@@ -174,9 +192,16 @@ export default function Home() {
   }, [phase, ticketId]);
 
   const endChat = (sysMsg?: string) => {
-    setChatOver(true);
+    if (chatOverRef.current) {
+      setGuessOpen(true);
+      return;
+    }
+    setChatEnded(true);
     if (sysMsg) {
-      setMessages((ms) => [...ms, { from: "system", text: sysMsg }]);
+      setMessages((ms) => {
+        if (ms.some((m) => m.text === sysMsg)) return ms;
+        return [...ms, { from: "system", text: sysMsg }];
+      });
     }
     setGuessOpen(true);
   };
@@ -233,7 +258,7 @@ export default function Home() {
         if (!r.ok) {
           if (r.sessionLost && phase === "chat" && !mustJudgeRef.current) {
             setSessionLost(true);
-            setChatOver(true);
+            setChatEnded(true);
           }
           return;
         }
@@ -267,10 +292,14 @@ export default function Home() {
           } else {
             setJudgeDeadlineAt(r.judgeDeadlineAt);
           }
-        } else if (r.expired && !mustJudgeRef.current && !chatOver) {
+        } else if (
+          r.expired &&
+          !mustJudgeRef.current &&
+          !chatOverRef.current
+        ) {
           endChat("时间到，请做出你的判断");
         } else if (r.chatLocked) {
-          setChatOver(true);
+          setChatEnded(true);
         }
       } catch {
         /* ignore */
@@ -288,7 +317,7 @@ export default function Home() {
   }, [phase, gameId]);
 
   const send = (text: string) => {
-    if (!gameId || chatOver || mustJudgeMode) return;
+    if (!gameId || chatOverRef.current || mustJudgeMode) return;
     setMessages((ms) => [...ms, { from: "player", text }]);
 
     chatMut.mutate(
@@ -300,13 +329,13 @@ export default function Home() {
               enterMustJudge(r.judgeDeadlineAt);
               return;
             }
-            if (r.chatLocked) {
-              setChatOver(true);
+            if (r.chatLocked && !r.limitReached && !r.expired) {
+              setChatEnded(true);
               return;
             }
             if (r.sessionLost) {
               setSessionLost(true);
-              setChatOver(true);
+              setChatEnded(true);
               setMessages((ms) => [
                 ...ms,
                 { from: "system", text: "连接中断，对方已离开" },
@@ -320,10 +349,7 @@ export default function Home() {
           }
 
           if (r.limitReached) {
-            window.setTimeout(
-              () => endChat("对方有事要忙，先离开了"),
-              900,
-            );
+            endChat("对方有事要忙，先离开了");
           }
         },
       },
@@ -338,7 +364,7 @@ export default function Home() {
         onSuccess: (r) => {
           if (r.phase === "lost") {
             setSessionLost(true);
-            setChatOver(true);
+            setChatEnded(true);
             setMessages((ms) => [
               ...ms,
               { from: "system", text: r.message },

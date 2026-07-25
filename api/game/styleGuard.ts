@@ -14,9 +14,15 @@ const FORBIDDEN = [
   /我理解你的感受/,
   /从.+角度来看/,
   /作为AI/,
+  /作为\s*AI/,
+  /作为一个\s*AI/,
   /作为语言模型/,
+  /人工智能助手/,
+  /语言模型/,
+  /机器人程序/,
   /ChatGPT/i,
   /我是(一个)?(AI|人工智能|语言模型)/i,
+  /我是\s*AI/i,
 ];
 
 export interface StyleGuardResult {
@@ -24,6 +30,33 @@ export interface StyleGuardResult {
   reasons: string[];
   severity: "low" | "medium" | "high";
   parts: string[];
+}
+
+/** Hard check on raw model text before any scrub rewriting. */
+export function runRawSafetyGuard(raw: string): StyleGuardResult {
+  const text = raw.trim();
+  if (!text) {
+    return { passed: false, reasons: ["empty"], severity: "high", parts: [] };
+  }
+  for (const re of FORBIDDEN) {
+    if (re.test(text)) {
+      return {
+        passed: false,
+        reasons: [`forbidden:${re}`],
+        severity: "high",
+        parts: [],
+      };
+    }
+  }
+  if (/^[\s]*[-*•\d]+[.\、]/.test(text) || text.includes("\n-")) {
+    return {
+      passed: false,
+      reasons: ["list_format"],
+      severity: "high",
+      parts: [],
+    };
+  }
+  return { passed: true, reasons: [], severity: "low", parts: [text] };
 }
 
 export function runStyleGuard(
@@ -37,23 +70,9 @@ export function runStyleGuard(
   // Hard-fail on raw model text BEFORE scrubReply can rewrite identity slips
   // into canned denials (which would falsely look "safe").
   for (const p of parts) {
-    for (const re of FORBIDDEN) {
-      if (re.test(p)) {
-        return {
-          passed: false,
-          reasons: [`forbidden:${re}`],
-          severity: "high",
-          parts: [],
-        };
-      }
-    }
-    if (/^[\s]*[-*•\d]+[.\、]/.test(p) || p.includes("\n-")) {
-      return {
-        passed: false,
-        reasons: ["list_format"],
-        severity: "high",
-        parts: [],
-      };
+    const raw = runRawSafetyGuard(p);
+    if (!raw.passed) {
+      return raw;
     }
   }
 
@@ -90,7 +109,13 @@ export function runStyleGuard(
     const id = p.slice(0, 24);
     if (usedReplyIds.includes(id) && p.length <= 8) {
       reasons.push("repeat_canned");
-      severity = severity === "high" ? "high" : "medium";
+      // Hard-fail so generator picks a fresh fallback instead of replaying.
+      return {
+        passed: false,
+        reasons,
+        severity: "medium",
+        parts: [],
+      };
     }
   }
 
@@ -101,7 +126,12 @@ export function runStyleGuard(
     cleaned = [cleaned[0].slice(0, 12)];
   }
 
-  const passed = !reasons.some((r) => r.startsWith("forbidden") || r === "list_format");
+  const passed = !reasons.some(
+    (r) =>
+      r.startsWith("forbidden") ||
+      r === "list_format" ||
+      r === "repeat_canned",
+  );
 
   return {
     passed: passed && cleaned.length > 0,
