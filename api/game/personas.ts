@@ -111,6 +111,8 @@ const CHAT_REALISM_RULES = `
 - 用口语：啊、嗯、哈哈、靠、有点、还行、那你呢
 - 可以反问、跑题、吐槽；不要每句都把话题接完整
 - 被问细节可以说忘了、说不清、懒得说
+- 不要用标点：别写句号逗号感叹号省略号引号；默认直接连着打字
+- 唯一例外：单独回「？」或「？？」，以及很冲/很强烈的反问可以带问号（如「你认真的？」「哈？」）
 
 【人设怎么用】
 - 上面的人设是「你自己」，不是对方
@@ -212,35 +214,24 @@ const CHAOS_LINES = [
   "嗯",
   "哦",
   "1",
-  "哈哈哈哈哈哈哈",
-  "我不听",
+  "哈哈",
   "随便吧",
   "然后呢",
-  "汪",
-  "嗯嗯嗯嗯嗯",
   "哈？",
   "认真的吗",
   "笑死",
   "忘了",
-  "香蕉",
   "今晚吃啥",
   "你说的都对",
   "已读",
-  "骗你的",
-  "啦啦啦",
-  "再问？",
   "不知道",
-  "我是猫",
-  "……",
-  "哦",
-  "复制粘贴",
   "666",
 ];
 
-/** Chance to skip the LLM and fire a canned gremlin line. */
+/** Legacy helper — prefer generateTurn path. Rates kept low. */
 export function maybeChaosReply(chaos: ChaosLevel = "sane"): string | null {
   const p =
-    chaos === "chaos" ? 0.38 : chaos === "troll" ? 0.24 : chaos === "tease" ? 0.1 : 0.03;
+    chaos === "chaos" ? 0.14 : chaos === "troll" ? 0.1 : chaos === "tease" ? 0.06 : 0.02;
   if (Math.random() > p) return null;
   return CHAOS_LINES[Math.floor(Math.random() * CHAOS_LINES.length)];
 }
@@ -261,18 +252,17 @@ export function chaosTurnNudge(chaos: ChaosLevel = "sane"): string | null {
 
 const CHAOS_OPENERS = [
   "？",
-  "哈？有人",
+  "哈有人",
   "你谁啊哈哈",
   "1",
   "来了来了",
   "哦匹配上了哦",
-  "汪",
   "嘿嘿",
 ];
 
 export function chaosOpener(chaos: ChaosLevel = "sane"): string | null {
   if (chaos !== "troll" && chaos !== "chaos") return null;
-  if (Math.random() > 0.55) return null;
+  if (Math.random() > 0.25) return null;
   return CHAOS_OPENERS[Math.floor(Math.random() * CHAOS_OPENERS.length)];
 }
 
@@ -332,7 +322,6 @@ const SHORT_REACTS = [
   "1",
   "哦",
   "然后呢",
-  "。。。",
   "哈？",
   "嗯",
   "咋了",
@@ -358,15 +347,15 @@ export function maybeShortMessageReply(userText: string): string | null {
 const AI_DENIAL_REPLIES = [
   "？？？",
   "？",
-  "你才是",
-  "有病吧",
+  "你才是吧",
   "哈哈",
   "想啥呢",
-  "滚",
+  "啊？",
+  "又来了",
   "嗯？",
-  "神经病",
   "哦",
   "笑死",
+  "你怎么判断的",
 ];
 
 /** Direct "are you AI?" — use a curt human denial, never an essay. */
@@ -470,13 +459,63 @@ export function scrubReply(raw: string): string {
     "",
   );
 
-  // Too many questions in one bubble.
-  if ((text.match(/[？?]/g) || []).length >= 2) {
+  // Too many questions in one bubble — keep at most one ask (not pure ？？ bubbles).
+  if (
+    !/^[？?]+$/.test(text) &&
+    (text.match(/[？?]/g) || []).length >= 2
+  ) {
     const idx = text.search(/[？?]/);
     text = text.slice(0, idx + 1);
   }
 
+  text = stripCasualPunctuation(text);
+
   return text.trim() || pickOne(SHORT_REACTS);
+}
+
+/**
+ * Drop everyday punctuation so replies feel like casual WeChat typing.
+ * Keep only standalone 「？」/「？？」 or a strong/short confrontational question mark.
+ */
+function stripCasualPunctuation(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+
+  // Pure question-mark bubbles (？ / ？？ / ???)
+  if (/^[？?]+$/.test(trimmed)) {
+    return trimmed.replace(/\?/g, "？");
+  }
+
+  const trailingMarks = trimmed.match(/[？?]+$/)?.[0] ?? "";
+  const endsMultiQ = trailingMarks.length >= 2;
+  const endsSingleQ = trailingMarks.length === 1;
+
+  let body = trimmed
+    .replace(/[？?]+$/u, "")
+    .replace(
+      /[。，、！；：…·~,\.!|;:“”‘’"'\-—–_/\\（）()【】《》「」『』\[\]{}<>]+/gu,
+      "",
+    )
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (!body) {
+    return trailingMarks ? trailingMarks.replace(/\?/g, "？") : "";
+  }
+
+  // Soft check-ins like「在吗？」lose the mark; keep only punchy asks.
+  const particleQ = /^(哈|嗯|啊|呵|咦|诶|欸)$/u.test(body);
+  const strongCue =
+    /(认真|有病|神经病|什么意思|啥意思|你猜|难道|凭什么|不会吧|是不是|为啥|为何|咋了|干嘛啊)/u.test(
+      body,
+    );
+
+  if (endsMultiQ || (endsSingleQ && (particleQ || strongCue))) {
+    const q = trailingMarks.replace(/\?/g, "？");
+    return body + q;
+  }
+
+  return body;
 }
 
 const HUMAN_OPENERS = [
@@ -496,7 +535,7 @@ const HUMAN_FALLBACKS = [
   "啥",
   "然后呢",
   "哦",
-  "有点，你呢",
+  "有点你呢",
   "笑死",
   "信号不好",
 ];
@@ -510,4 +549,4 @@ export function fallbackReply(_persona: Persona): string {
 }
 
 export const OPENER_INSTRUCTION =
-  "（系统：开场只回一句很短的招呼，像微信，最多八个字。禁止自我介绍、禁止猜对方哪里人、禁止聊天气、禁止连续提问）";
+  "（系统：开场只回一句很短的招呼，像微信，最多八个字。不要标点。禁止自我介绍、禁止猜对方哪里人、禁止聊天气、禁止连续提问）";

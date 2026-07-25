@@ -1,9 +1,9 @@
 // Shared types & constants between frontend and backend.
 
-/** Internal persona assigned to an LLM opponent (disguise). */
+/** @deprecated Prefer SocialPersona cluster; kept for DB enum compat. */
 export type Persona = "human" | "machine";
 
-/** Whether the opponent is a real player or an LLM. */
+/** Real opponent kind — server-only until reveal. */
 export type OpponentSource = "player" | "llm";
 
 /** The player's guess / the revealed truth. */
@@ -20,6 +20,9 @@ export const MATCH_WINDOW_SEC = 10;
 /** After one side judges, the other must answer within this many seconds. */
 export const JUDGE_RESPONSE_SEC = 20;
 
+export const TIME_LIMIT_SEC = 120;
+export const MAX_PLAYER_MESSAGES = 12;
+
 export interface MatchJoinResult {
   ticketId: string;
   matchWindowSec: number;
@@ -27,96 +30,77 @@ export interface MatchJoinResult {
   joinedAt: number;
 }
 
+/** Matched payload — no identity fields before reveal. */
 export type MatchStatus =
   | {
       status: "searching";
-      /** Elapsed ms since join. */
       elapsedMs: number;
       matchWindowSec: number;
     }
   | {
       status: "matched";
       gameId: string;
-      /** Opening line (AI only; empty for PvP). */
-      opener: string;
       timeLimitSec: number;
       maxPlayerMessages: number;
-      /** Hidden from UI during chat; useful for client bookkeeping. */
-      opponentSource: OpponentSource;
     }
   | {
       status: "cancelled";
     };
 
-export interface GameStartResult {
-  gameId: string;
-  /** The opponent's opening line. */
-  opener: string;
-  timeLimitSec: number;
-  maxPlayerMessages: number;
+/** chat() always returns this shape for AI and PvP. */
+export interface ChatAck {
+  ok: true;
+  acceptedAt: number;
+  limitReached: boolean;
 }
 
-export interface ChatReplyResult {
-  ok: boolean;
-  reply?: string;
-  /** Simulated human typing delay for the client-side typing indicator. */
-  typingMs?: number;
-  /** Time is up — client should move to the guessing phase. */
-  expired?: boolean;
-  /** Message quota exhausted — client should move to the guessing phase. */
-  limitReached?: boolean;
-  /** Session lost (server restarted etc.) — client should offer a restart. */
-  sessionLost?: boolean;
-  /**
-   * PvP: message accepted but no immediate reply.
-   * Client should poll `sync` for opponent messages.
-   */
-  pending?: boolean;
-  /** Chat locked because someone already judged. */
-  chatLocked?: boolean;
-  opponentJudged?: boolean;
-  judgeDeadlineAt?: number;
+export type ChatResult =
+  | ChatAck
+  | {
+      ok: false;
+      expired?: boolean;
+      limitReached?: boolean;
+      sessionLost?: boolean;
+      chatLocked?: boolean;
+      mustJudge?: boolean;
+      judgeDeadlineAt?: number;
+    };
+
+/** Unified conversation event (AI and PvP). */
+export interface ConversationEvent {
+  seq: number;
+  type: "message" | "system";
+  from: "opponent" | "system";
+  text: string;
+  deliverAt: number;
 }
 
-export interface SyncResult {
-  ok: boolean;
-  sessionLost?: boolean;
-  expired?: boolean;
-  /** New opponent (and system) messages since `after`. */
-  messages: ChatMessageView[];
-  /** Next cursor for subsequent sync calls. */
-  cursor: number;
-  opponentLeft?: boolean;
-  chatLocked?: boolean;
-  opponentJudged?: boolean;
-  mustJudge?: boolean;
-  judgeDeadlineAt?: number;
-}
-
-/** Periodic heartbeat while in chat / waiting — drives AI early-judge & timeouts. */
-export type PulseResult =
+/** Unified pull — replaces sync + pulse. */
+export type EventPullResult =
   | {
       ok: true;
       phase: "chat";
+      cursor: number;
+      events: ConversationEvent[];
       chatLocked: boolean;
-      opponentJudged: boolean;
       mustJudge: boolean;
       judgeDeadlineAt: number | null;
-      systemMessages: ChatMessageView[];
-      /** AI follow-ups while you were silent (e.g. 「在吗」). */
-      opponentMessages: ChatMessageView[];
-      /** Client typing-indicator delay before revealing opponentMessages. */
-      typingMs?: number;
+      /** Server clock says the chat window is over. */
+      expired?: boolean;
     }
   | {
       ok: true;
       phase: "waiting";
+      cursor: number;
+      events: ConversationEvent[];
       deadlineAt: number;
       message: string;
     }
   | {
       ok: true;
       phase: "revealed";
+      cursor: number;
+      events: ConversationEvent[];
       result: GuessResult;
     }
   | {
@@ -153,12 +137,40 @@ export interface GuessResult {
   /** Other player's guess, or AI's flavor judgment of you. */
   opponentGuess: GuessChoice | null;
   opponentTimedOut: boolean;
-  /** Real player vs LLM-backed opponent. */
+  /** Only present after reveal. */
   opponentSource: OpponentSource;
   playerMessages: number;
   opponentMessages: number;
   stats: GlobalStats;
 }
 
-export const TIME_LIMIT_SEC = 120;
-export const MAX_PLAYER_MESSAGES = 12;
+// ── Legacy aliases (gradually unused) ──
+/** @deprecated Use ChatResult */
+export type ChatReplyResult = ChatResult & {
+  reply?: string;
+  typingMs?: number;
+  pending?: boolean;
+  opponentJudged?: boolean;
+};
+/** @deprecated Use EventPullResult */
+export type SyncResult = {
+  ok: boolean;
+  sessionLost?: boolean;
+  expired?: boolean;
+  messages: ChatMessageView[];
+  cursor: number;
+  opponentLeft?: boolean;
+  chatLocked?: boolean;
+  opponentJudged?: boolean;
+  mustJudge?: boolean;
+  judgeDeadlineAt?: number;
+};
+/** @deprecated Use EventPullResult */
+export type PulseResult = EventPullResult;
+/** @deprecated */
+export interface GameStartResult {
+  gameId: string;
+  opener: string;
+  timeLimitSec: number;
+  maxPlayerMessages: number;
+}

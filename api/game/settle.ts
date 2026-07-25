@@ -11,11 +11,14 @@ import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
 import {
   deleteSession,
+  enqueueSystemMessage,
   getRoom,
   getSession,
   type GameSession,
   type Seat,
 } from "./store";
+import { INITIAL_CONFIG } from "./config";
+import { flavorJudgePlayer } from "./aiJudgment";
 
 const JUDGE_MS = JUDGE_RESPONSE_SEC * 1000;
 
@@ -68,6 +71,7 @@ export async function computeStats(): Promise<GlobalStats> {
 }
 
 function pushNotice(session: GameSession, text: string) {
+  enqueueSystemMessage(session, text);
   session.localNotices.push(text);
 }
 
@@ -79,6 +83,13 @@ function roomNotice(
   const room = getRoom(roomId);
   if (!room) return;
   room.notices.push({ to, text, at: Date.now() });
+  const targets: Seat[] =
+    to === "both" ? ["a", "b"] : [to];
+  for (const seat of targets) {
+    const sid = room.seats[seat];
+    const s = getSession(sid);
+    if (s) enqueueSystemMessage(s, text);
+  }
 }
 
 function drainNotices(session: GameSession): { from: "system"; text: string }[] {
@@ -127,11 +138,6 @@ async function persistPlayer(
   }
 }
 
-function randomAiJudgment(): GuessChoice {
-  // Flavor only — slight bias toward "human" since the player is always human.
-  return Math.random() < 0.7 ? "human" : "ai";
-}
-
 /** Trigger AI early-judge if the rolled time has come. */
 export function maybeTriggerAiEarlyJudge(session: GameSession): void {
   if (session.mode !== "ai" || session.settled) return;
@@ -139,8 +145,20 @@ export function maybeTriggerAiEarlyJudge(session: GameSession): void {
   if (!session.aiEarlyJudgeAt) return;
   if (Date.now() < session.aiEarlyJudgeAt) return;
 
+  const elapsed = Date.now() - session.startedAt;
+  const totalMsgs = session.playerCount + session.opponentCount;
+  if (
+    elapsed < INITIAL_CONFIG.earlyJudgeMinElapsedMs ||
+    session.playerCount < INITIAL_CONFIG.earlyJudgeMinPlayerMessages ||
+    totalMsgs < INITIAL_CONFIG.earlyJudgeMinTotalMessages
+  ) {
+    // Defer until thresholds met.
+    session.aiEarlyJudgeAt = Date.now() + 8_000;
+    return;
+  }
+
   session.aiJudgedAt = Date.now();
-  session.aiJudgment = randomAiJudgment();
+  session.aiJudgment = flavorJudgePlayer(session);
   session.responseDeadline = Date.now() + JUDGE_MS;
   session.finished = true; // lock chat
   pushNotice(
@@ -155,7 +173,7 @@ export function maybeResolveAiReply(session: GameSession): boolean {
   if (!session.waitingForOpponent || !session.aiReplyAt) return false;
   if (Date.now() < session.aiReplyAt) return false;
 
-  session.aiJudgment = randomAiJudgment();
+  session.aiJudgment = flavorJudgePlayer(session);
   session.aiJudgedAt = Date.now();
   return true;
 }
@@ -261,7 +279,7 @@ export async function revealIfReady(
     }
 
     if (maybeTimeoutResponder(session)) {
-      if (!session.aiJudgment) session.aiJudgment = randomAiJudgment();
+      if (!session.aiJudgment) session.aiJudgment = flavorJudgePlayer(session);
       return commitReveal(session);
     }
 

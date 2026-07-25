@@ -1,6 +1,10 @@
 import type { GuessChoice, OpponentSource, Persona } from "@contracts/types";
+import type { ConversationEvent } from "@contracts/types";
 import type { ChaosLevel, ReplyPace } from "./personas";
 import type { LlmHistoryItem } from "./llm";
+import { defaultEmotion, type EmotionalState } from "./emotion";
+import { pickSocialPersona } from "./socialPersonas";
+import { INITIAL_CONFIG } from "./config";
 
 export type Seat = "a" | "b";
 
@@ -18,7 +22,7 @@ export interface SeatVerdict {
 
 export interface PvpRoom {
   id: string;
-  seats: Record<Seat, string>; // gameId per seat
+  seats: Record<Seat, string>;
   messages: PvpMessage[];
   startedAt: number;
   left: Partial<Record<Seat, boolean>>;
@@ -26,8 +30,32 @@ export interface PvpRoom {
   firstFinisher: Seat | null;
   responseDeadline: number | null;
   revealed: boolean;
-  /** System lines delivered per seat (cursor by index). */
   notices: { to: Seat | "both"; text: string; at: number }[];
+}
+
+export interface WorkingMemory {
+  userFacts: Array<{
+    key: string;
+    value: string;
+    confidence: number;
+    turn: number;
+  }>;
+  selfFacts: Record<string, string>;
+  recentTopics: string[];
+  emotionalState: EmotionalState;
+  usedReplyIds: string[];
+  recentTurnActions: string[];
+  accusationCount: number;
+  strongChaosTurns: number;
+  metaTurns: number;
+}
+
+export interface OutboxItem {
+  seq: number;
+  type: "message" | "system";
+  from: "opponent" | "system";
+  text: string;
+  deliverAt: number;
 }
 
 export interface GameSession {
@@ -35,6 +63,8 @@ export interface GameSession {
   mode: "ai" | "pvp";
   persona: Persona;
   opponentSource: OpponentSource;
+  /** Structured social persona id (AI only). */
+  socialPersonaId: string | null;
   card: string | null;
   replyPace: ReplyPace;
   chaos: ChaosLevel;
@@ -46,33 +76,34 @@ export interface GameSession {
   opponentCount: number;
   finished: boolean;
 
-  // ── Dual-judge settlement ──
   myGuess: GuessChoice | null;
   timedOut: boolean;
   waitingForOpponent: boolean;
   settled: boolean;
-  /** AI flavor judgment of the player (not scored). */
   aiJudgment: GuessChoice | null;
   aiJudgedAt: number | null;
-  /** Random time when AI may early-judge; null = AI never early-judges. */
   aiEarlyJudgeAt: number | null;
-  /** After player judges first, AI reveals after this timestamp. */
   aiReplyAt: number | null;
-  /** Deadline for the player to answer after AI / peer judged. */
   responseDeadline: number | null;
-  /** Notices already pushed to this client via pulse. */
   noticeCursor: number;
   localNotices: string[];
 
-  // ── Proactive AI nudges while player is silent ──
   lastPlayerActivityAt: number;
   lastOpponentActivityAt: number;
   nextNudgeAt: number | null;
   nudgeCount: number;
   pendingNudges: string[];
-  /** Held opener when AI does not speak immediately at match. */
   pendingOpener: string | null;
   delayedOpenerAt: number | null;
+
+  /** Unified delivery queue (AI + PvP peer messages). */
+  outbox: OutboxItem[];
+  outboxSeq: number;
+  /** Prevent overlapping AI generations. */
+  aiJobPending: boolean;
+  /** Player lines waiting for AI turn generation. */
+  aiReplyQueue: string[];
+  memory: WorkingMemory;
 }
 
 const sessions = new Map<string, GameSession>();
@@ -90,12 +121,79 @@ function prune() {
   }
 }
 
-/** ~55% of AI games early-judge at a random moment during the chat window. */
+function emptyMemory(): WorkingMemory {
+  return {
+    userFacts: [],
+    selfFacts: {},
+    recentTopics: [],
+    emotionalState: defaultEmotion(),
+    usedReplyIds: [],
+    recentTurnActions: [],
+    accusationCount: 0,
+    strongChaosTurns: 0,
+    metaTurns: 0,
+  };
+}
+
+/** Early-judge only after enough chat; ~45% of AI games. */
 function rollAiEarlyJudgeAt(startedAt: number): number | null {
-  if (Math.random() > 0.55) return null;
-  // Between ~12s and ~100s into the chat.
-  const delay = 12_000 + Math.random() * 88_000;
+  if (Math.random() > 0.45) return null;
+  const delay =
+    INITIAL_CONFIG.earlyJudgeMinElapsedMs + Math.random() * 70_000;
   return startedAt + delay;
+}
+
+export function enqueueEvent(
+  session: GameSession,
+  item: Omit<OutboxItem, "seq">,
+): OutboxItem {
+  session.outboxSeq += 1;
+  const row: OutboxItem = { ...item, seq: session.outboxSeq };
+  session.outbox.push(row);
+  return row;
+}
+
+export function enqueueOpponentMessage(
+  session: GameSession,
+  text: string,
+  deliverAt: number,
+): void {
+  enqueueEvent(session, {
+    type: "message",
+    from: "opponent",
+    text,
+    deliverAt,
+  });
+}
+
+export function enqueueSystemMessage(
+  session: GameSession,
+  text: string,
+  deliverAt = Date.now(),
+): void {
+  enqueueEvent(session, {
+    type: "system",
+    from: "system",
+    text,
+    deliverAt,
+  });
+}
+
+/** Pull due events after cursor; advances nothing — caller sets cursor. */
+export function peekDueEvents(
+  session: GameSession,
+  cursor: number,
+): ConversationEvent[] {
+  const now = Date.now();
+  return session.outbox
+    .filter((e) => e.seq > cursor && e.deliverAt <= now)
+    .map((e) => ({
+      seq: e.seq,
+      type: e.type,
+      from: e.from,
+      text: e.text,
+      deliverAt: e.deliverAt,
+    }));
 }
 
 export function createAiSession(
@@ -104,14 +202,19 @@ export function createAiSession(
   card: string | null,
   replyPace: ReplyPace = "normal",
   chaos: ChaosLevel = "sane",
+  socialPersonaId?: string | null,
 ): GameSession {
   prune();
   const startedAt = Date.now();
+  const social = socialPersonaId
+    ? { id: socialPersonaId }
+    : pickSocialPersona();
   const session: GameSession = {
     id,
     mode: "ai",
     persona,
     opponentSource: "llm",
+    socialPersonaId: social.id,
     card,
     replyPace,
     chaos,
@@ -140,6 +243,11 @@ export function createAiSession(
     pendingNudges: [],
     pendingOpener: null,
     delayedOpenerAt: null,
+    outbox: [],
+    outboxSeq: 0,
+    aiJobPending: false,
+    aiReplyQueue: [],
+    memory: emptyMemory(),
   };
   sessions.set(id, session);
   return session;
@@ -170,6 +278,7 @@ export function createPvpPair(
     mode: "pvp" as const,
     persona: "human" as const,
     opponentSource: "player" as const,
+    socialPersonaId: null as string | null,
     card: null,
     replyPace: "normal" as const,
     chaos: "sane" as const,
@@ -197,10 +306,29 @@ export function createPvpPair(
     pendingNudges: [] as string[],
     pendingOpener: null as string | null,
     delayedOpenerAt: null as number | null,
+    outbox: [] as OutboxItem[],
+    outboxSeq: 0,
+    aiJobPending: false,
+    aiReplyQueue: [] as string[],
+    memory: emptyMemory(),
   };
 
-  const sessionA: GameSession = { ...base, id: gameIdA, seat: "a" };
-  const sessionB: GameSession = { ...base, id: gameIdB, seat: "b" };
+  const sessionA: GameSession = {
+    ...base,
+    id: gameIdA,
+    seat: "a",
+    memory: emptyMemory(),
+    outbox: [],
+    aiReplyQueue: [],
+  };
+  const sessionB: GameSession = {
+    ...base,
+    id: gameIdB,
+    seat: "b",
+    memory: emptyMemory(),
+    outbox: [],
+    aiReplyQueue: [],
+  };
   sessions.set(gameIdA, sessionA);
   sessions.set(gameIdB, sessionB);
   return { room, sessionA, sessionB };

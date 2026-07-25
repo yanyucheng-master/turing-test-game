@@ -9,7 +9,6 @@ import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
 import { callLLM } from "./llm";
 import {
-  pickPersonaCard,
   buildSystemPrompt,
   fallbackOpener,
   scrubReply,
@@ -18,6 +17,7 @@ import {
 } from "./personas";
 import { createAiSession, createPvpPair } from "./store";
 import { beginSilentMatch, holdDelayedOpener } from "./proactive";
+import { pickSocialPersona } from "./socialPersonas";
 
 const MATCH_WINDOW_MS = MATCH_WINDOW_SEC * 1000;
 
@@ -26,17 +26,15 @@ type TicketStatus = "searching" | "resolving" | "matched" | "cancelled";
 interface Ticket {
   id: string;
   joinedAt: number;
-  /** Absolute timestamp when AI would join if no human appears first. */
   aiArriveAt: number;
   status: TicketStatus;
   gameId?: string;
-  opener?: string;
+  /** Server-only; never sent in matched payload. */
   opponentSource?: OpponentSource;
 }
 
 const tickets = new Map<string, Ticket>();
 
-/** Random AI arrival inside the 10s window (min 200ms so humans can snatch). */
 function rollAiArriveAt(joinedAt: number): number {
   const delay = Math.random() * MATCH_WINDOW_MS;
   return joinedAt + Math.max(200, delay);
@@ -49,7 +47,6 @@ function pruneTickets() {
   }
 }
 
-/** Still in queue and not committed to a game — human can claim. */
 function isPairable(t: Ticket): boolean {
   return (
     !t.gameId &&
@@ -88,10 +85,6 @@ function findPartner(self: Ticket): Ticket | undefined {
   return undefined;
 }
 
-/**
- * Human-priority pairing. Wins over a pending AI join as long as the AI
- * game has not been committed yet (even mid-opener generation).
- */
 function tryPairHumans(self: Ticket): boolean {
   if (!isPairable(self)) return false;
   const partner = findPartner(self);
@@ -112,30 +105,17 @@ function tryPairHumans(self: Ticket): boolean {
     ])
     .catch((err) => console.error("[match] pvp db insert failed:", err));
 
-  finalizeMatched(self, {
-    gameId: gameIdA,
-    opener: "",
-    opponentSource: "player",
-  });
-  finalizeMatched(partner, {
-    gameId: gameIdB,
-    opener: "",
-    opponentSource: "player",
-  });
+  finalizeMatched(self, { gameId: gameIdA, opponentSource: "player" });
+  finalizeMatched(partner, { gameId: gameIdB, opponentSource: "player" });
   return true;
 }
 
 function finalizeMatched(
   ticket: Ticket,
-  info: {
-    gameId: string;
-    opener: string;
-    opponentSource: OpponentSource;
-  },
+  info: { gameId: string; opponentSource: OpponentSource },
 ) {
   ticket.status = "matched";
   ticket.gameId = info.gameId;
-  ticket.opener = info.opener;
   ticket.opponentSource = info.opponentSource;
 }
 
@@ -143,32 +123,27 @@ async function startAiGame(ticket: Ticket): Promise<void> {
   if (ticket.status !== "searching" || ticket.gameId) return;
   ticket.status = "resolving";
 
-  // Last human check before spending LLM tokens.
   if (tryPairHumans(ticket)) return;
 
+  const social = pickSocialPersona();
   const persona: Persona = Math.random() < 0.5 ? "human" : "machine";
-  const card = pickPersonaCard(persona);
-  const chaos = card.chaos ?? "sane";
+  const chaos = social.chaos === "troll" ? "troll" : social.chaos;
   const gameId = randomUUID();
   const session = createAiSession(
     gameId,
     persona,
-    card.blurb,
-    card.pace,
+    social.identity.blurb,
+    social.tempo.pace,
     chaos,
+    social.id,
   );
 
-  // Who speaks first — vary like real strangers.
-  // immediate ~40% | delayed ~30% | wait for player ~30%
   const roll = Math.random();
   const openStyle: "immediate" | "delayed" | "wait" =
     roll < 0.4 ? "immediate" : roll < 0.7 ? "delayed" : "wait";
 
-  // Never put opener in the match payload — client should see typing first.
-  const clientOpener = "";
-
   if (openStyle !== "wait") {
-    const system = buildSystemPrompt(persona, card.blurb, chaos);
+    const system = buildSystemPrompt(persona, social.identity.blurb, chaos);
     const forcedChaosOpener = chaosOpener(chaos);
     let opener: string;
     if (forcedChaosOpener) {
@@ -182,48 +157,29 @@ async function startAiGame(ticket: Ticket): Promise<void> {
       opener = scrubReply(rawOpener ?? "") || fallbackOpener(persona);
     }
 
-    // Human may have stolen the ticket while the opener was generating.
-    if (
-      ticket.gameId ||
-      ticket.status === "matched" ||
-      ticket.status === "cancelled"
-    ) {
+    if (ticket.gameId || ticket.status !== "resolving") {
       return;
     }
 
-    // immediate: short beat then typing; delayed: linger before speaking
     const noticeMs =
-      openStyle === "immediate"
-        ? 400 + Math.random() * 1_200
-        : undefined;
+      openStyle === "immediate" ? 400 + Math.random() * 1_200 : undefined;
     holdDelayedOpener(session, opener, noticeMs);
   } else {
     beginSilentMatch(session);
   }
 
   try {
-    // DB persona marks opponent kind for stats (machine = LLM).
-    // Session.persona stays as the speech disguise (human/machine style).
     await getDb().insert(games).values({ id: gameId, persona: "machine" });
   } catch (err) {
     console.error("[match] ai db insert failed:", err);
   }
 
-  // Final human check after DB write, before commit.
   if (tryPairHumans(ticket)) return;
-  if (ticket.gameId || ticket.status === "cancelled") return;
+  if (ticket.gameId || ticket.status !== "resolving") return;
 
-  finalizeMatched(ticket, {
-    gameId,
-    opener: clientOpener,
-    opponentSource: "llm",
-  });
+  finalizeMatched(ticket, { gameId, opponentSource: "llm" });
 }
 
-/**
- * Resolve ticket state.
- * Priority: real human partner → AI at rolled arrive time → AI at 10s hard cap.
- */
 export async function pollMatch(ticketId: string): Promise<MatchStatus> {
   const ticket = tickets.get(ticketId);
   if (!ticket || ticket.status === "cancelled") {
@@ -234,24 +190,19 @@ export async function pollMatch(ticketId: string): Promise<MatchStatus> {
     return matchedPayload(ticket);
   }
 
-  // 1) Human always wins if another pairable player exists.
   if (tryPairHumans(ticket)) {
     return matchedPayload(ticket);
   }
 
   const now = Date.now();
 
-  // 2) AI arrives at random time (or hard 10s cap).
   if (
     ticket.status === "searching" &&
     (now >= ticket.aiArriveAt || now >= ticket.joinedAt + MATCH_WINDOW_MS)
   ) {
     await startAiGame(ticket);
-    if (ticket.status === "matched" && ticket.gameId) {
+    if (ticket.gameId) {
       return matchedPayload(ticket);
-    }
-    if (ticket.status === "cancelled") {
-      return { status: "cancelled" };
     }
   }
 
@@ -266,9 +217,7 @@ function matchedPayload(ticket: Ticket): MatchStatus {
   return {
     status: "matched",
     gameId: ticket.gameId!,
-    opener: ticket.opener ?? "",
     timeLimitSec: TIME_LIMIT_SEC,
     maxPlayerMessages: MAX_PLAYER_MESSAGES,
-    opponentSource: ticket.opponentSource ?? "llm",
   };
 }

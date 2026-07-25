@@ -10,7 +10,6 @@ import type {
   ChatMessageView,
   GuessChoice,
   GuessResult,
-  OpponentSource,
 } from "@contracts/types";
 import { TIME_LIMIT_SEC } from "@contracts/types";
 
@@ -22,8 +21,6 @@ export default function Home() {
   const [matchElapsedMs, setMatchElapsedMs] = useState(0);
   const [matchWindowSec, setMatchWindowSec] = useState(10);
   const [gameId, setGameId] = useState<string | null>(null);
-  const [opponentSource, setOpponentSource] =
-    useState<OpponentSource | null>(null);
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
   const [deadline, setDeadline] = useState(0);
   const [secondsLeft, setSecondsLeft] = useState(TIME_LIMIT_SEC);
@@ -38,21 +35,20 @@ export default function Home() {
   const [result, setResult] = useState<GuessResult | null>(null);
   const [showVerdict, setShowVerdict] = useState(false);
   const [sessionLost, setSessionLost] = useState(false);
-  const syncCursorRef = useRef(0);
+  const eventCursorRef = useRef(0);
   const matchJoinedAtRef = useRef(0);
   const mustJudgeRef = useRef(false);
 
-  const utils = trpc.useUtils();
   const joinMut = trpc.game.joinMatch.useMutation();
   const pollMut = trpc.game.pollMatch.useMutation();
   const cancelMut = trpc.game.cancelMatch.useMutation();
   const chatMut = trpc.game.chat.useMutation();
   const finishMut = trpc.game.finish.useMutation();
-  const pulseMut = trpc.game.pulse.useMutation();
+  const eventsMut = trpc.game.events.useMutation();
   const pollAsyncRef = useRef(pollMut.mutateAsync);
   pollAsyncRef.current = pollMut.mutateAsync;
-  const pulseAsyncRef = useRef(pulseMut.mutateAsync);
-  pulseAsyncRef.current = pulseMut.mutateAsync;
+  const eventsAsyncRef = useRef(eventsMut.mutateAsync);
+  eventsAsyncRef.current = eventsMut.mutateAsync;
 
   const showReveal = (r: GuessResult) => {
     setResult(r);
@@ -93,14 +89,10 @@ export default function Home() {
 
   const enterChat = (r: {
     gameId: string;
-    opener: string;
     timeLimitSec: number;
-    opponentSource: OpponentSource;
   }) => {
     setGameId(r.gameId);
-    setOpponentSource(r.opponentSource);
-    syncCursorRef.current = 0;
-    // Opener arrives later via pulse after a human-like delay.
+    eventCursorRef.current = 0;
     setMessages([{ from: "system", text: "已为你匹配一位匿名对话者" }]);
     setResult(null);
     setShowVerdict(false);
@@ -181,7 +173,7 @@ export default function Home() {
     setGuessOpen(true);
   };
 
-  // Chat countdown (normal game timer)
+  // Chat countdown
   useEffect(() => {
     if (phase !== "chat" || chatOver || mustJudgeMode || !deadline) return;
     const t = setInterval(() => {
@@ -196,7 +188,7 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, chatOver, deadline, mustJudgeMode]);
 
-  // Judge response countdown (20s)
+  // Judge response countdown
   useEffect(() => {
     if (!mustJudgeMode || !judgeDeadlineAt || phase !== "chat") return;
     const t = setInterval(() => {
@@ -216,7 +208,7 @@ export default function Home() {
     return () => clearInterval(t);
   }, [phase]);
 
-  // Pulse during chat + waiting
+  // Unified events poll (AI + PvP)
   useEffect(() => {
     if ((phase !== "chat" && phase !== "waiting") || !gameId) return;
     let stopped = false;
@@ -224,7 +216,10 @@ export default function Home() {
     const tick = async () => {
       if (stopped) return;
       try {
-        const r = await pulseAsyncRef.current({ gameId });
+        const r = await eventsAsyncRef.current({
+          gameId,
+          cursor: eventCursorRef.current,
+        });
         if (stopped) return;
         if (!r.ok) {
           if (r.sessionLost && phase === "chat" && !mustJudgeRef.current) {
@@ -233,6 +228,16 @@ export default function Home() {
           }
           return;
         }
+
+        if (r.events.length > 0) {
+          eventCursorRef.current = r.cursor;
+          const incoming: ChatMessageView[] = r.events.map((e) => ({
+            from: e.from,
+            text: e.text,
+          }));
+          setMessages((ms) => [...ms, ...incoming]);
+        }
+
         if (r.phase === "revealed") {
           showReveal(r.result);
           return;
@@ -246,26 +251,16 @@ export default function Home() {
           }
           return;
         }
-        // chat phase pulse
-        if (r.systemMessages.length > 0) {
-          setMessages((ms) => [...ms, ...r.systemMessages]);
-        }
-        if (r.opponentMessages?.length) {
-          const incoming = r.opponentMessages;
-          const delay = r.typingMs ?? 1500;
-          window.setTimeout(() => {
-            if (mustJudgeRef.current) return;
-            setMessages((ms) => [...ms, ...incoming]);
-          }, delay);
-        }
+
         if (r.mustJudge && r.judgeDeadlineAt) {
           if (!mustJudgeRef.current) {
             enterMustJudge(r.judgeDeadlineAt);
           } else {
             setJudgeDeadlineAt(r.judgeDeadlineAt);
           }
-        }
-        if (r.chatLocked) {
+        } else if (r.expired && !mustJudgeRef.current && !chatOver) {
+          endChat("时间到，请做出你的判断");
+        } else if (r.chatLocked) {
           setChatOver(true);
         }
       } catch {
@@ -282,55 +277,6 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, gameId]);
 
-  // PvP message sync
-  useEffect(() => {
-    if (phase !== "chat" || !gameId || opponentSource !== "player") return;
-    let stopped = false;
-    const pull = async () => {
-      if (stopped) return;
-      try {
-        const r = await utils.game.sync.fetch({
-          gameId,
-          cursor: syncCursorRef.current,
-        });
-        if (stopped) return;
-        if (!r.ok) {
-          if (r.sessionLost || r.opponentLeft) {
-            setSessionLost(true);
-            setChatOver(true);
-            setMessages((ms) => [
-              ...ms,
-              { from: "system", text: "连接中断，对方已离开" },
-            ]);
-          } else if (r.expired && !mustJudgeRef.current) {
-            endChat("时间到，请做出你的判断");
-          }
-          return;
-        }
-        if (r.messages.length > 0) {
-          setMessages((ms) => [...ms, ...r.messages]);
-        }
-        syncCursorRef.current = r.cursor;
-        if (r.mustJudge && r.judgeDeadlineAt && !mustJudgeRef.current) {
-          enterMustJudge(r.judgeDeadlineAt);
-        } else if (r.chatLocked) {
-          setChatOver(true);
-        } else if (r.expired && !mustJudgeRef.current && !chatOver) {
-          endChat("时间到，请做出你的判断");
-        }
-      } catch {
-        /* ignore */
-      }
-    };
-    void pull();
-    const id = window.setInterval(() => void pull(), 700);
-    return () => {
-      stopped = true;
-      window.clearInterval(id);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, gameId, opponentSource]);
-
   const send = (text: string) => {
     if (!gameId || chatOver || mustJudgeMode) return;
     setMessages((ms) => [...ms, { from: "player", text }]);
@@ -340,7 +286,7 @@ export default function Home() {
       {
         onSuccess: (r) => {
           if (!r.ok) {
-            if (r.opponentJudged && r.judgeDeadlineAt) {
+            if (r.mustJudge && r.judgeDeadlineAt) {
               enterMustJudge(r.judgeDeadlineAt);
               return;
             }
@@ -363,27 +309,12 @@ export default function Home() {
             return;
           }
 
-          if (r.pending) {
-            if (r.limitReached) {
-              window.setTimeout(
-                () => endChat("消息条数已用尽，请做出判断"),
-                600,
-              );
-            }
-            return;
+          if (r.limitReached) {
+            window.setTimeout(
+              () => endChat("对方有事要忙，先离开了"),
+              900,
+            );
           }
-
-          const delay = r.typingMs ?? 1500;
-          window.setTimeout(() => {
-            if (mustJudgeRef.current) return;
-            setMessages((ms) => [
-              ...ms,
-              { from: "opponent", text: r.reply ?? "" },
-            ]);
-            if (r.limitReached) {
-              window.setTimeout(() => endChat("对方有事要忙，先离开了"), 900);
-            }
-          }, delay);
         },
       },
     );
@@ -408,10 +339,7 @@ export default function Home() {
   if (phase === "intro") {
     return (
       <div>
-        <IntroScreen
-          starting={joinMut.isPending}
-          onStart={startMatch}
-        />
+        <IntroScreen starting={joinMut.isPending} onStart={startMatch} />
         {joinMut.isError && (
           <p className="fixed bottom-6 left-1/2 -translate-x-1/2 font-mono-x text-xs text-[var(--accent)]">
             匹配失败，请再试一次
@@ -458,7 +386,6 @@ export default function Home() {
         submitting={finishMut.isPending}
         onGuess={guess}
         onClose={() => {
-          // Allow reviewing history even in must-judge mode.
           setGuessOpen(false);
         }}
       />

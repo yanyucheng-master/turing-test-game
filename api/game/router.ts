@@ -4,27 +4,22 @@ import {
   TIME_LIMIT_SEC,
   MAX_PLAYER_MESSAGES,
   MATCH_WINDOW_SEC,
-  type ChatReplyResult,
-  type SyncResult,
+  type ChatResult,
   type MatchJoinResult,
   type MatchStatus,
   type FinishResult,
-  type PulseResult,
+  type EventPullResult,
   type GuessResult,
 } from "@contracts/types";
-import { callLLM } from "./llm";
 import {
-  buildSystemPrompt,
-  fallbackReply,
-  scrubReply,
-  typingDelayMs,
-  maybeChaosReply,
-  maybeShortMessageReply,
-  maybeAiAccusationReply,
-  chaosTurnNudge,
-} from "./personas";
-import { getSession, getRoom, type Seat } from "./store";
+  getSession,
+  getRoom,
+  peekDueEvents,
+  enqueueOpponentMessage,
+  type Seat,
+} from "./store";
 import { joinMatch, pollMatch, cancelMatch } from "./matchmaking";
+import { queueAiGeneration } from "./aiWorker";
 import {
   computeStats,
   truthOf,
@@ -34,17 +29,11 @@ import {
   chatLocked,
   mustJudge,
   judgeDeadlineAt,
-  takeSystemMessages,
   waitingMessage,
   waitingDeadline,
   getSettledResult,
 } from "./settle";
-import {
-  afterAiReply,
-  onPlayerActivity,
-  maybeProactiveNudge,
-  drainPendingNudges,
-} from "./proactive";
+import { onPlayerActivity, maybeProactiveNudge } from "./proactive";
 
 function emptyGuess(): GuessResult {
   return {
@@ -84,9 +73,13 @@ export const gameRouter = createRouter({
       return { ok: true as const };
     }),
 
+  /**
+   * Unified chat ACK — identical shape for AI and PvP.
+   * Never waits on LLM; never returns opponent reply.
+   */
   chat: publicQuery
     .input(z.object({ gameId: z.string(), text: z.string().min(1).max(500) }))
-    .mutation(async ({ input }): Promise<ChatReplyResult> => {
+    .mutation(async ({ input }): Promise<ChatResult> => {
       const session = getSession(input.gameId);
       if (!session) {
         if (getSettledResult(input.gameId)) {
@@ -101,7 +94,7 @@ export const gameRouter = createRouter({
         return {
           ok: false,
           chatLocked: true,
-          opponentJudged: mustJudge(session),
+          mustJudge: mustJudge(session),
           judgeDeadlineAt: judgeDeadlineAt(session) ?? undefined,
         };
       }
@@ -133,153 +126,48 @@ export const gameRouter = createRouter({
           return { ok: false, sessionLost: true };
         }
         room.messages.push({ seat: session.seat, text, at: Date.now() });
-        const limitReached = session.playerCount >= MAX_PLAYER_MESSAGES;
-        return { ok: true, pending: true, limitReached };
-      }
-
-      session.history.push({ role: "user", content: text });
-
-      // AI may early-judge mid-conversation instead of replying.
-      maybeTriggerAiEarlyJudge(session);
-      if (session.aiJudgedAt && !session.myGuess) {
-        return {
-          ok: false,
-          chatLocked: true,
-          opponentJudged: true,
-          judgeDeadlineAt: judgeDeadlineAt(session) ?? undefined,
-        };
-      }
-
-      const canned =
-        maybeAiAccusationReply(text) ??
-        maybeShortMessageReply(text) ??
-        maybeChaosReply(session.chaos);
-      let reply: string;
-      if (canned) {
-        reply = canned;
+        const peer = getSession(room.seats[other]);
+        if (peer) {
+          enqueueOpponentMessage(peer, text, Date.now());
+          peer.opponentCount += 1;
+        }
       } else {
-        const system = buildSystemPrompt(
-          session.persona,
-          session.card,
-          session.chaos,
-        );
-        const nudge = chaosTurnNudge(session.chaos);
-        const history = nudge
-          ? [
-              ...session.history.slice(-20),
-              { role: "user" as const, content: nudge },
-            ]
-          : session.history.slice(-20);
-        const temp =
-          session.chaos === "chaos" || session.chaos === "troll"
-            ? 1.2
-            : session.persona === "human"
-              ? 1.05
-              : 0.95;
-        const raw =
-          (await callLLM(system, history, {
-            maxTokens: 48,
-            temperature: temp,
-          })) ?? "";
-        reply = scrubReply(raw) || fallbackReply(session.persona);
+        // User line is appended inside aiWorker when the turn starts,
+        // so rapid messages stay ordered as u1,a1,u2,a2.
+        maybeTriggerAiEarlyJudge(session);
+        if (!(session.aiJudgedAt && !session.myGuess)) {
+          queueAiGeneration(session, text);
+        }
       }
-
-      // Re-check after LLM wait — AI early-judge may have fired.
-      maybeTriggerAiEarlyJudge(session);
-      if (session.aiJudgedAt && !session.myGuess) {
-        return {
-          ok: false,
-          chatLocked: true,
-          opponentJudged: true,
-          judgeDeadlineAt: judgeDeadlineAt(session) ?? undefined,
-        };
-      }
-
-      session.history.push({ role: "assistant", content: reply });
-      session.opponentCount += 1;
-      afterAiReply(session);
-
-      const limitReached = session.playerCount >= MAX_PLAYER_MESSAGES;
 
       return {
         ok: true,
-        reply,
-        typingMs: typingDelayMs(reply, session.replyPace),
-        limitReached,
+        acceptedAt: Date.now(),
+        limitReached: session.playerCount >= MAX_PLAYER_MESSAGES,
       };
     }),
 
-  sync: publicQuery
+  /**
+   * Unified event pull — replaces sync + pulse.
+   * Same endpoint / cadence for AI and PvP.
+   */
+  events: publicQuery
     .input(
       z.object({
         gameId: z.string(),
         cursor: z.number().int().min(0).default(0),
       }),
     )
-    .query(async ({ input }): Promise<SyncResult> => {
-      const session = getSession(input.gameId);
-      if (!session) {
-        return {
-          ok: false,
-          sessionLost: !getSettledResult(input.gameId),
-          messages: [],
-          cursor: input.cursor,
-        };
-      }
-
-      maybeTriggerAiEarlyJudge(session);
-
-      if (session.mode !== "pvp" || !session.roomId || !session.seat) {
-        return {
-          ok: true,
-          messages: [],
-          cursor: input.cursor,
-          chatLocked: chatLocked(session),
-          opponentJudged: mustJudge(session),
-          mustJudge: mustJudge(session),
-          judgeDeadlineAt: judgeDeadlineAt(session) ?? undefined,
-        };
-      }
-
-      const room = getRoom(session.roomId);
-      if (!room) {
-        return {
-          ok: false,
-          sessionLost: true,
-          messages: [],
-          cursor: input.cursor,
-        };
-      }
-
-      const elapsed = (Date.now() - room.startedAt) / 1000;
-      const expired = elapsed > TIME_LIMIT_SEC + 5;
-      const other: Seat = session.seat === "a" ? "b" : "a";
-
-      const messages = room.messages
-        .slice(input.cursor)
-        .filter((m) => m.seat !== session.seat)
-        .map((m) => ({ from: "opponent" as const, text: m.text }));
-
-      return {
-        ok: true,
-        messages,
-        cursor: room.messages.length,
-        expired,
-        opponentLeft: !!room.left[other],
-        chatLocked: chatLocked(session),
-        opponentJudged: mustJudge(session),
-        mustJudge: mustJudge(session),
-        judgeDeadlineAt: judgeDeadlineAt(session) ?? undefined,
-      };
-    }),
-
-  /** Heartbeat: AI early-judge, timeouts, waiting → reveal. */
-  pulse: publicQuery
-    .input(z.object({ gameId: z.string() }))
-    .mutation(async ({ input }): Promise<PulseResult> => {
+    .mutation(async ({ input }): Promise<EventPullResult> => {
       const cached = getSettledResult(input.gameId);
       if (cached) {
-        return { ok: true, phase: "revealed", result: cached };
+        return {
+          ok: true,
+          phase: "revealed",
+          cursor: input.cursor,
+          events: [],
+          result: cached,
+        };
       }
 
       const session = getSession(input.gameId);
@@ -289,13 +177,24 @@ export const gameRouter = createRouter({
 
       const revealed = await revealIfReady(session);
       if (revealed) {
-        return { ok: true, phase: "revealed", result: revealed };
+        return {
+          ok: true,
+          phase: "revealed",
+          cursor: input.cursor,
+          events: [],
+          result: revealed,
+        };
       }
 
-      // Session may have been deleted by a concurrent reveal — re-check cache.
       const after = getSettledResult(input.gameId);
       if (after) {
-        return { ok: true, phase: "revealed", result: after };
+        return {
+          ok: true,
+          phase: "revealed",
+          cursor: input.cursor,
+          events: [],
+          result: after,
+        };
       }
 
       const live = getSession(input.gameId);
@@ -304,36 +203,43 @@ export const gameRouter = createRouter({
       }
 
       maybeTriggerAiEarlyJudge(live);
-      const nudged = maybeProactiveNudge(live);
-      const pending = nudged.length ? nudged : drainPendingNudges(live);
-      const systemMessages = takeSystemMessages(live);
-      const opponentMessages = pending.map((text) => ({
-        from: "opponent" as const,
-        text,
-      }));
-      const typingMs = pending.length
-        ? typingDelayMs(pending.join(""), live.replyPace)
-        : undefined;
+      maybeProactiveNudge(live);
+
+      const events = peekDueEvents(live, input.cursor);
+      const cursor =
+        events.length > 0
+          ? events[events.length - 1].seq
+          : input.cursor;
 
       if (live.waitingForOpponent) {
         return {
           ok: true,
           phase: "waiting",
+          cursor,
+          events,
           deadlineAt: waitingDeadline(live),
           message: waitingMessage(),
         };
       }
 
+      const startedAt =
+        live.mode === "pvp" && live.roomId
+          ? (getRoom(live.roomId)?.startedAt ?? live.startedAt)
+          : live.startedAt;
+      const expired =
+        !live.myGuess &&
+        !live.aiJudgedAt &&
+        (Date.now() - startedAt) / 1000 > TIME_LIMIT_SEC + 5;
+
       return {
         ok: true,
         phase: "chat",
-        chatLocked: chatLocked(live),
-        opponentJudged: mustJudge(live),
+        cursor,
+        events,
+        chatLocked: chatLocked(live) || expired,
         mustJudge: mustJudge(live),
         judgeDeadlineAt: judgeDeadlineAt(live),
-        systemMessages,
-        opponentMessages,
-        typingMs,
+        expired,
       };
     }),
 
@@ -359,7 +265,6 @@ export const gameRouter = createRouter({
         };
       }
 
-      // Idempotent re-fetch while waiting.
       if (session.myGuess && session.waitingForOpponent) {
         const revealed = await revealIfReady(session);
         if (revealed) return { phase: "revealed", result: revealed };
@@ -381,21 +286,11 @@ export const gameRouter = createRouter({
         };
       }
 
-      const result =
-        (await revealIfReady(session)) ??
-        (await (async () => {
-          // Force reveal path for AI when both already set.
-          if (session.myGuess && session.aiJudgment) {
-            return revealIfReady(session);
-          }
-          return null;
-        })());
-
+      const result = await revealIfReady(session);
       if (result) {
         return { phase: "revealed", result };
       }
 
-      // PvP second submit should have revealed; if not, wait briefly.
       if (session.waitingForOpponent) {
         return {
           phase: "waiting",
