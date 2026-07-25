@@ -258,10 +258,15 @@ export const gameRouter = createRouter({
 
       const session = getSession(input.gameId);
       if (!session) {
-        const stats = await computeStats();
+        if (getSettledResult(input.gameId)) {
+          return {
+            phase: "revealed",
+            result: getSettledResult(input.gameId)!,
+          };
+        }
         return {
-          phase: "revealed",
-          result: { ...emptyGuess(), stats },
+          phase: "lost",
+          message: "对局已失效，请重新开始（不会伪造对方身份）",
         };
       }
 

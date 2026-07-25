@@ -1,7 +1,8 @@
 import type { GameSession } from "./store";
 import { enqueueOpponentMessage, getSession } from "./store";
-import { generateOpponentTurn } from "./generateTurn";
-import { afterAiReply } from "./proactive";
+import { generateOpponentTurn, generateOpeningTurn } from "./generateTurn";
+import { afterAiReply, holdDelayedOpener } from "./proactive";
+import { fallbackOpener } from "./personas";
 
 function pumpQueue(gameId: string): void {
   const session = getSession(gameId);
@@ -40,7 +41,6 @@ function pumpQueue(gameId: string): void {
       const s = getSession(gameId);
       if (s) {
         s.aiJobPending = false;
-        // Continue with any lines queued while we were generating.
         pumpQueue(gameId);
       }
     }
@@ -58,4 +58,44 @@ export function queueAiGeneration(
   if (session.finished || session.myGuess || session.aiJudgedAt) return;
   session.aiReplyQueue.push(playerText);
   pumpQueue(session.id);
+}
+
+/**
+ * Generate opening off the matchmaking hot path.
+ */
+export function queueOpeningTurn(
+  session: GameSession,
+  openStyle: "immediate" | "delayed",
+): void {
+  const gameId = session.id;
+  void (async () => {
+    try {
+      const live = getSession(gameId);
+      if (!live || live.mode !== "ai") return;
+      // Player already spoke — skip opener.
+      if (live.lastPlayerActivityAt > 0 || live.playerCount > 0) return;
+
+      let opener: string;
+      try {
+        opener = await generateOpeningTurn(live);
+      } catch {
+        opener = fallbackOpener(live.persona);
+      }
+      if (!opener.trim()) opener = fallbackOpener(live.persona);
+
+      const again = getSession(gameId);
+      if (!again || again.lastPlayerActivityAt > 0 || again.playerCount > 0) {
+        return;
+      }
+      if (again.pendingOpener || again.opponentCount > 0) return;
+
+      const noticeMs =
+        openStyle === "immediate"
+          ? 400 + Math.random() * 1_200
+          : 2_500 + Math.random() * 6_000;
+      holdDelayedOpener(again, opener, noticeMs);
+    } catch (err) {
+      console.error("[aiWorker] opening failed:", err);
+    }
+  })();
 }

@@ -33,6 +33,30 @@ export function runStyleGuard(
 ): StyleGuardResult {
   const reasons: string[] = [];
   let severity: StyleGuardResult["severity"] = "low";
+
+  // Hard-fail on raw model text BEFORE scrubReply can rewrite identity slips
+  // into canned denials (which would falsely look "safe").
+  for (const p of parts) {
+    for (const re of FORBIDDEN) {
+      if (re.test(p)) {
+        return {
+          passed: false,
+          reasons: [`forbidden:${re}`],
+          severity: "high",
+          parts: [],
+        };
+      }
+    }
+    if (/^[\s]*[-*•\d]+[.\、]/.test(p) || p.includes("\n-")) {
+      return {
+        passed: false,
+        reasons: ["list_format"],
+        severity: "high",
+        parts: [],
+      };
+    }
+  }
+
   let cleaned = parts
     .map((p) => scrubReply(p))
     .map((p) => p.trim())
@@ -60,19 +84,6 @@ export function runStyleGuard(
     // Prefer drop second part over hard mid-cut of first.
     if (cleaned.length > 1) cleaned = [cleaned[0]];
     else cleaned = [cleaned[0].slice(0, INITIAL_CONFIG.maxTotalLength)];
-  }
-
-  for (const p of cleaned) {
-    for (const re of FORBIDDEN) {
-      if (re.test(p)) {
-        reasons.push(`forbidden:${re}`);
-        severity = "high";
-      }
-    }
-    if (/^[\s]*[-*•\d]+[.\、]/.test(p) || p.includes("\n-")) {
-      reasons.push("list_format");
-      severity = "high";
-    }
   }
 
   for (const p of cleaned) {

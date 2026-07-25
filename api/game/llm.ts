@@ -3,6 +3,8 @@ import "dotenv/config";
 const AI_API_KEY = process.env.DEFAULT_AI_API_KEY ?? "";
 const AI_BASE_URL = (process.env.DEFAULT_AI_BASE_URL ?? "").replace(/\/+$/, "");
 const AI_MODEL = process.env.DEFAULT_AI_MODEL ?? "";
+/** Prefer OpenAI-compatible; set LLM_PROTOCOL=anthropic to force Anthropic shape. */
+const AI_PROTOCOL = (process.env.LLM_PROTOCOL ?? "openai").toLowerCase();
 
 export interface LlmHistoryItem {
   role: "user" | "assistant";
@@ -44,7 +46,6 @@ async function postJson(
   }
 }
 
-/** Strategy 1: OpenAI-compatible /chat/completions. */
 async function tryOpenAI(
   system: string,
   history: LlmHistoryItem[],
@@ -53,25 +54,23 @@ async function tryOpenAI(
   const data = (await postJson(
     `${AI_BASE_URL}/chat/completions`,
     {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${AI_API_KEY}`,
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${AI_API_KEY}`,
     },
     {
       model: AI_MODEL,
       messages: [{ role: "system", content: system }, ...history],
       max_tokens: opts.maxTokens ?? 150,
       temperature: opts.temperature ?? 0.9,
-      // DeepSeek V4 defaults to thinking; empty content would look like a failed reply.
       thinking: { type: "disabled" },
     },
-    opts.timeoutMs ?? 25_000,
+    opts.timeoutMs ?? 8_000,
   )) as { choices?: { message?: { content?: unknown } }[] } | null;
 
   const text = data?.choices?.[0]?.message?.content;
   return typeof text === "string" && text.trim() ? text.trim() : null;
 }
 
-/** Strategy 2: Anthropic-compatible /messages. */
 async function tryAnthropic(
   system: string,
   history: LlmHistoryItem[],
@@ -93,7 +92,7 @@ async function tryAnthropic(
       temperature: opts.temperature ?? 0.9,
       thinking: { type: "disabled" },
     },
-    opts.timeoutMs ?? 25_000,
+    opts.timeoutMs ?? 8_000,
   )) as { content?: { type?: string; text?: unknown }[] } | null;
 
   const block = data?.content?.find((b) => b?.type === "text");
@@ -102,9 +101,8 @@ async function tryAnthropic(
 }
 
 /**
- * Calls the platform-provisioned LLM endpoint. Tries the OpenAI-compatible
- * shape first, then the Anthropic-compatible shape. Returns null when every
- * strategy fails so callers can fall back to canned lines.
+ * Single-protocol LLM call (default OpenAI-compatible).
+ * Does not blind-fall through both providers — that doubled worst-case latency.
  */
 export async function callLLM(
   system: string,
@@ -115,6 +113,10 @@ export async function callLLM(
     console.error("[llm] missing DEFAULT_AI_* credentials");
     return null;
   }
-  return (await tryOpenAI(system, history, opts)) ??
-    (await tryAnthropic(system, history, opts));
+  const timeoutMs = opts.timeoutMs ?? 8_000;
+  const next = { ...opts, timeoutMs };
+  if (AI_PROTOCOL === "anthropic") {
+    return tryAnthropic(system, history, next);
+  }
+  return tryOpenAI(system, history, next);
 }

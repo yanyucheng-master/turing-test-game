@@ -127,12 +127,16 @@ export default function Home() {
     setPhase("intro");
   };
 
-  // Matchmaking poll
+  // Matchmaking poll (no overlapping requests)
   useEffect(() => {
     if (phase !== "matching" || !ticketId) return;
     let stopped = false;
-    const tick = async () => {
-      if (stopped) return;
+    let timer = 0;
+    let polling = false;
+
+    const loop = async () => {
+      if (stopped || polling) return;
+      polling = true;
       try {
         const status = await pollAsyncRef.current({ ticketId });
         if (stopped) return;
@@ -143,15 +147,19 @@ export default function Home() {
         }
         if (status.status === "searching") {
           setMatchElapsedMs(status.elapsedMs);
+        } else if (status.status === "matched") {
+          enterChat(status);
           return;
         }
-        if (status.status === "matched") enterChat(status);
       } catch {
         /* keep polling */
+      } finally {
+        polling = false;
+        if (!stopped) timer = window.setTimeout(() => void loop(), 400);
       }
     };
-    void tick();
-    const id = window.setInterval(() => void tick(), 400);
+
+    void loop();
     const localClock = window.setInterval(() => {
       if (matchJoinedAtRef.current) {
         setMatchElapsedMs(Date.now() - matchJoinedAtRef.current);
@@ -159,7 +167,7 @@ export default function Home() {
     }, 100);
     return () => {
       stopped = true;
-      window.clearInterval(id);
+      window.clearTimeout(timer);
       window.clearInterval(localClock);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -208,12 +216,13 @@ export default function Home() {
     return () => clearInterval(t);
   }, [phase]);
 
-  // Unified events poll (AI + PvP)
+  // Unified events poll — recursive timeout avoids overlapping requests
   useEffect(() => {
     if ((phase !== "chat" && phase !== "waiting") || !gameId) return;
     let stopped = false;
+    let timer = 0;
 
-    const tick = async () => {
+    const loop = async () => {
       if (stopped) return;
       try {
         const r = await eventsAsyncRef.current({
@@ -265,14 +274,15 @@ export default function Home() {
         }
       } catch {
         /* ignore */
+      } finally {
+        if (!stopped) timer = window.setTimeout(() => void loop(), 600);
       }
     };
 
-    void tick();
-    const id = window.setInterval(() => void tick(), 600);
+    void loop();
     return () => {
       stopped = true;
-      window.clearInterval(id);
+      window.clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, gameId]);
@@ -326,6 +336,15 @@ export default function Home() {
       { gameId, guess: choice },
       {
         onSuccess: (r) => {
+          if (r.phase === "lost") {
+            setSessionLost(true);
+            setChatOver(true);
+            setMessages((ms) => [
+              ...ms,
+              { from: "system", text: r.message },
+            ]);
+            return;
+          }
           if (r.phase === "waiting") {
             enterWaiting(r.deadlineAt, r.message);
             return;

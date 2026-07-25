@@ -117,6 +117,10 @@ export type FinishResult =
   | {
       phase: "revealed";
       result: GuessResult;
+    }
+  | {
+      phase: "lost";
+      message: string;
     };
 
 export interface GlobalStats {

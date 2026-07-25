@@ -40,6 +40,11 @@ export function classifyUserAct(
     return "goodbye";
   }
 
+  // Greetings before short_reaction — otherwise「你好」「嗨」are misclassified.
+  if (/^(你好|嗨|哈喽|hello|hi|在吗)$/i.test(t)) {
+    return "greeting";
+  }
+
   if (/^[哈呵嘿嗯哦啊唉]+$|^[?？]+$|^[0-9]+$|^6{2,}$|^1$/.test(t) || t.length <= 2) {
     return "short_reaction";
   }

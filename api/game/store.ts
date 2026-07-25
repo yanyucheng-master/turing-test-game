@@ -3,7 +3,7 @@ import type { ConversationEvent } from "@contracts/types";
 import type { ChaosLevel, ReplyPace } from "./personas";
 import type { LlmHistoryItem } from "./llm";
 import { defaultEmotion, type EmotionalState } from "./emotion";
-import { pickSocialPersona } from "./socialPersonas";
+import { getSocialPersona, pickSocialPersona } from "./socialPersonas";
 import { INITIAL_CONFIG } from "./config";
 
 export type Seat = "a" | "b";
@@ -99,6 +99,8 @@ export interface GameSession {
   /** Unified delivery queue (AI + PvP peer messages). */
   outbox: OutboxItem[];
   outboxSeq: number;
+  /** Monotonic floor so later messages cannot overtake earlier ones. */
+  lastScheduledDeliveryAt: number;
   /** Prevent overlapping AI generations. */
   aiJobPending: boolean;
   /** Player lines waiting for AI turn generation. */
@@ -153,6 +155,13 @@ export function enqueueEvent(
   return row;
 }
 
+function scheduleDeliverAt(session: GameSession, requestedAt: number): number {
+  const floor = Math.max(session.lastScheduledDeliveryAt || 0, Date.now());
+  const deliverAt = Math.max(requestedAt, floor + 350);
+  session.lastScheduledDeliveryAt = deliverAt;
+  return deliverAt;
+}
+
 export function enqueueOpponentMessage(
   session: GameSession,
   text: string,
@@ -162,7 +171,7 @@ export function enqueueOpponentMessage(
     type: "message",
     from: "opponent",
     text,
-    deliverAt,
+    deliverAt: scheduleDeliverAt(session, deliverAt),
   });
 }
 
@@ -175,25 +184,48 @@ export function enqueueSystemMessage(
     type: "system",
     from: "system",
     text,
-    deliverAt,
+    deliverAt: scheduleDeliverAt(session, deliverAt),
   });
 }
 
-/** Pull due events after cursor; advances nothing — caller sets cursor. */
+/** Make all pending outbox items visible now (e.g. when chat locks). */
+export function flushOutbox(session: GameSession): void {
+  const now = Date.now();
+  for (const e of session.outbox) {
+    if (e.deliverAt > now) e.deliverAt = now;
+  }
+  session.lastScheduledDeliveryAt = Math.max(
+    session.lastScheduledDeliveryAt,
+    now,
+  );
+}
+
+/**
+ * Pull contiguous due events after cursor.
+ * Stops at the first not-yet-due item so a later short-delay message
+ * cannot advance the cursor past an earlier delayed message.
+ */
 export function peekDueEvents(
   session: GameSession,
   cursor: number,
 ): ConversationEvent[] {
   const now = Date.now();
-  return session.outbox
-    .filter((e) => e.seq > cursor && e.deliverAt <= now)
-    .map((e) => ({
+  const pending = session.outbox
+    .filter((e) => e.seq > cursor)
+    .sort((a, b) => a.seq - b.seq);
+
+  const result: ConversationEvent[] = [];
+  for (const e of pending) {
+    if (e.deliverAt > now) break;
+    result.push({
       seq: e.seq,
       type: e.type,
       from: e.from,
       text: e.text,
       deliverAt: e.deliverAt,
-    }));
+    });
+  }
+  return result;
 }
 
 export function createAiSession(
@@ -245,10 +277,17 @@ export function createAiSession(
     delayedOpenerAt: null,
     outbox: [],
     outboxSeq: 0,
+    lastScheduledDeliveryAt: 0,
     aiJobPending: false,
     aiReplyQueue: [],
     memory: emptyMemory(),
   };
+  if (session.socialPersonaId) {
+    const sp = getSocialPersona(session.socialPersonaId);
+    session.memory.selfFacts.ageRange = sp.identity.ageRange;
+    session.memory.selfFacts.occupation = sp.identity.occupation;
+    session.memory.selfFacts.situation = sp.identity.currentSituation;
+  }
   sessions.set(id, session);
   return session;
 }
@@ -308,6 +347,7 @@ export function createPvpPair(
     delayedOpenerAt: null as number | null,
     outbox: [] as OutboxItem[],
     outboxSeq: 0,
+    lastScheduledDeliveryAt: 0,
     aiJobPending: false,
     aiReplyQueue: [] as string[],
     memory: emptyMemory(),

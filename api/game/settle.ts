@@ -12,6 +12,7 @@ import { games } from "@db/schema";
 import {
   deleteSession,
   enqueueSystemMessage,
+  flushOutbox,
   getRoom,
   getSession,
   type GameSession,
@@ -161,6 +162,7 @@ export function maybeTriggerAiEarlyJudge(session: GameSession): void {
   session.aiJudgment = flavorJudgePlayer(session);
   session.responseDeadline = Date.now() + JUDGE_MS;
   session.finished = true; // lock chat
+  flushOutbox(session);
   pushNotice(
     session,
     `对方已提交判断，请在 ${JUDGE_RESPONSE_SEC} 秒内做出你的判断`,

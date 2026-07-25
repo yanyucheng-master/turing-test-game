@@ -120,18 +120,28 @@ function parseModelJson(raw: string): {
   }
 }
 
-function applyMemoryPatch(
-  session: GameSession,
-  patch:
-    | {
-        newUserFacts?: Array<{ key?: string; value: string } | string>;
-        newSelfFacts?: Record<string, string>;
-      }
-    | undefined,
-) {
+const IMMUTABLE_SELF_KEYS = new Set([
+  "ageRange",
+  "occupation",
+  "situation",
+  "age",
+  "city",
+]);
+
+type MemoryPatch = {
+  newUserFacts?: Array<{ key?: string; value: string } | string>;
+  newSelfFacts?: Record<string, string>;
+};
+
+function applyMemoryPatch(session: GameSession, patch: MemoryPatch | undefined) {
   if (!patch) return;
   if (patch.newSelfFacts) {
-    Object.assign(session.memory.selfFacts, patch.newSelfFacts);
+    for (const [key, value] of Object.entries(patch.newSelfFacts)) {
+      if (IMMUTABLE_SELF_KEYS.has(key)) continue;
+      if (session.memory.selfFacts[key] == null) {
+        session.memory.selfFacts[key] = value;
+      }
+    }
   }
   if (patch.newUserFacts?.length) {
     for (const f of patch.newUserFacts) {
@@ -152,6 +162,26 @@ function applyMemoryPatch(
       session.memory.userFacts = session.memory.userFacts.slice(-8);
     }
   }
+}
+
+export function safePersonaFallback(
+  session: GameSession,
+  act: UserAct,
+): string {
+  const persona = getSocialPersona(session.socialPersonaId);
+  if (act === "ai_accusation") {
+    return pickUnused(ACCUSATION_SOFT, session.memory.usedReplyIds);
+  }
+  if (act === "knowledge_question") return "这我不太懂";
+  if (act === "personal_question") {
+    return persona.boundaries.privateQuestion === "answer"
+      ? "还好吧"
+      : "不太方便说";
+  }
+  if (act === "greeting") {
+    return pickUnused(["嗨", "哈喽", "嘿"], session.memory.usedReplyIds);
+  }
+  return pickUnused(SHORT_POOL, session.memory.usedReplyIds);
 }
 
 function cannedPath(
@@ -200,6 +230,8 @@ export async function generateOpponentTurn(
 
   let parts = cannedPath(session, userAct, plan, persona);
 
+  let acceptedPatch: MemoryPatch | undefined;
+
   if (!parts) {
     const knowledgeNote = `${knowledge.topic}/${knowledge.level} → ${knowledge.behavior}`;
     const system = buildSystemPrompt(persona, plan, session, knowledgeNote);
@@ -208,39 +240,54 @@ export async function generateOpponentTurn(
       (await callLLM(system, history, {
         maxTokens: 80,
         temperature: 1.0,
+        timeoutMs: 8_000,
       })) ?? "";
 
     let parsed = parseModelJson(raw);
     if (!parsed) {
-      // plain text fallback
       const scrubbed = scrubReply(raw);
       parts = scrubbed ? [scrubbed] : null;
     } else {
       parts = parsed.replyParts;
-      applyMemoryPatch(session, parsed.memoryPatch);
+      acceptedPatch = parsed.memoryPatch;
     }
 
     let guard = runStyleGuard(parts ?? [], plan, session.memory.usedReplyIds);
-    if ((!guard.passed || guard.severity === "high") && INITIAL_CONFIG.maxRewriteAttempts > 0) {
+    if (
+      (!guard.passed || guard.severity === "high") &&
+      INITIAL_CONFIG.maxRewriteAttempts > 0
+    ) {
+      acceptedPatch = undefined;
       raw =
         (await callLLM(
           system + "\n\n上次输出不合格，请更短、更口语、不要助手腔，只回JSON。",
           history,
-          { maxTokens: 60, temperature: 0.95 },
+          { maxTokens: 60, temperature: 0.95, timeoutMs: 8_000 },
         )) ?? "";
       parsed = parseModelJson(raw);
       parts = parsed?.replyParts ?? (scrubReply(raw) ? [scrubReply(raw)] : []);
-      if (parsed) applyMemoryPatch(session, parsed.memoryPatch);
+      acceptedPatch = parsed?.memoryPatch;
       guard = runStyleGuard(parts, plan, session.memory.usedReplyIds);
     }
-    parts = guard.parts.length
-      ? guard.parts
-      : [scrubReply(fallbackReply("human")) || "嗯"];
+
+    if (!guard.passed || guard.severity === "high" || !guard.parts.length) {
+      parts = [safePersonaFallback(session, userAct)];
+      acceptedPatch = undefined;
+    } else {
+      parts = guard.parts;
+      applyMemoryPatch(session, acceptedPatch);
+    }
   } else {
-    parts = runStyleGuard(parts, plan, session.memory.usedReplyIds).parts;
+    const guard = runStyleGuard(parts, plan, session.memory.usedReplyIds);
+    parts =
+      !guard.passed || guard.severity === "high" || !guard.parts.length
+        ? [safePersonaFallback(session, userAct)]
+        : guard.parts;
   }
 
-  if (!parts.length) parts = ["嗯"];
+  if (!parts.length) {
+    parts = [scrubReply(fallbackReply("human")) || "嗯"];
+  }
 
   for (const p of parts) {
     const id = p.slice(0, 24);
@@ -270,4 +317,37 @@ export async function generateOpponentTurn(
   const deliveries = scheduleDeliveries(parts, baseDelay);
 
   return { replyParts: parts, deliveries, plan, userAct };
+}
+
+/** Opening line through the same guard pipeline — never blocks matchmaking. */
+export async function generateOpeningTurn(
+  session: GameSession,
+): Promise<string> {
+  const persona = getSocialPersona(session.socialPersonaId);
+  const system = `你是刚匹配到的匿名网友。人设：${persona.identity.blurb}。
+只回一句很短招呼（最多八个字），像微信。不要标点（单独？除外）。不要自我介绍、不要猜对方、不要聊天气。
+只返回JSON：{"replyParts":["招呼"],"memoryPatch":{},"turnAction":"opener"}`;
+
+  const raw =
+    (await callLLM(
+      system,
+      [{ role: "user", content: "（系统：开场）" }],
+      { maxTokens: 24, temperature: 1.0, timeoutMs: 8_000 },
+    )) ?? "";
+
+  const parsed = parseModelJson(raw);
+  let parts = parsed?.replyParts ?? (scrubReply(raw) ? [scrubReply(raw)] : []);
+  const plan: TurnPlan = {
+    answerMode: "direct",
+    stance: "neutral",
+    relationshipAction: "none",
+    outputShape: "single",
+    targetLength: "tiny",
+    emotionalTone: "neutral",
+  };
+  const guard = runStyleGuard(parts, plan, session.memory.usedReplyIds);
+  if (!guard.passed || guard.severity === "high" || !guard.parts.length) {
+    return safePersonaFallback(session, "greeting");
+  }
+  return guard.parts[0];
 }

@@ -54,7 +54,7 @@ export function onPlayerActivity(session: GameSession): void {
 
 export function afterAiReply(session: GameSession): void {
   session.lastOpponentActivityAt = Date.now();
-  session.nudgeCount = 0;
+  // Do NOT reset nudgeCount — followUpMax is per-match, not per-reply.
   scheduleProactiveNudge(session);
 }
 

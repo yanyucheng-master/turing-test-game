@@ -7,17 +7,10 @@ import {
 import type { MatchStatus, OpponentSource, Persona } from "@contracts/types";
 import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
-import { callLLM } from "./llm";
-import {
-  buildSystemPrompt,
-  fallbackOpener,
-  scrubReply,
-  chaosOpener,
-  OPENER_INSTRUCTION,
-} from "./personas";
 import { createAiSession, createPvpPair } from "./store";
-import { beginSilentMatch, holdDelayedOpener } from "./proactive";
+import { beginSilentMatch } from "./proactive";
 import { pickSocialPersona } from "./socialPersonas";
+import { queueOpeningTurn } from "./aiWorker";
 
 const MATCH_WINDOW_MS = MATCH_WINDOW_SEC * 1000;
 
@@ -47,11 +40,9 @@ function pruneTickets() {
   }
 }
 
+/** Only searching tickets without a committed game can pair. */
 function isPairable(t: Ticket): boolean {
-  return (
-    !t.gameId &&
-    (t.status === "searching" || t.status === "resolving")
-  );
+  return !t.gameId && t.status === "searching";
 }
 
 export function joinMatch(): { ticketId: string; joinedAt: number } {
@@ -119,10 +110,17 @@ function finalizeMatched(
   ticket.opponentSource = info.opponentSource;
 }
 
-async function startAiGame(ticket: Ticket): Promise<void> {
+/**
+ * Commit AI match immediately — never await LLM or DB inside pollMatch.
+ * Opening line is generated asynchronously into the outbox.
+ */
+function startAiGame(ticket: Ticket): void {
   if (ticket.status !== "searching" || ticket.gameId) return;
-  ticket.status = "resolving";
 
+  // Last human check before committing AI.
+  if (tryPairHumans(ticket)) return;
+
+  ticket.status = "resolving";
   if (tryPairHumans(ticket)) return;
 
   const social = pickSocialPersona();
@@ -138,46 +136,23 @@ async function startAiGame(ticket: Ticket): Promise<void> {
     social.id,
   );
 
+  // Atomic commit — pollMatch can return matched without waiting.
+  finalizeMatched(ticket, { gameId, opponentSource: "llm" });
+
+  void getDb()
+    .insert(games)
+    .values({ id: gameId, persona: "machine" })
+    .catch((err) => console.error("[match] ai db insert failed:", err));
+
   const roll = Math.random();
   const openStyle: "immediate" | "delayed" | "wait" =
     roll < 0.4 ? "immediate" : roll < 0.7 ? "delayed" : "wait";
 
-  if (openStyle !== "wait") {
-    const system = buildSystemPrompt(persona, social.identity.blurb, chaos);
-    const forcedChaosOpener = chaosOpener(chaos);
-    let opener: string;
-    if (forcedChaosOpener) {
-      opener = forcedChaosOpener;
-    } else {
-      const rawOpener = await callLLM(
-        system,
-        [{ role: "user", content: OPENER_INSTRUCTION }],
-        { maxTokens: 24, temperature: 1.05 },
-      );
-      opener = scrubReply(rawOpener ?? "") || fallbackOpener(persona);
-    }
-
-    if (ticket.gameId || ticket.status !== "resolving") {
-      return;
-    }
-
-    const noticeMs =
-      openStyle === "immediate" ? 400 + Math.random() * 1_200 : undefined;
-    holdDelayedOpener(session, opener, noticeMs);
-  } else {
+  if (openStyle === "wait") {
     beginSilentMatch(session);
+  } else {
+    queueOpeningTurn(session, openStyle);
   }
-
-  try {
-    await getDb().insert(games).values({ id: gameId, persona: "machine" });
-  } catch (err) {
-    console.error("[match] ai db insert failed:", err);
-  }
-
-  if (tryPairHumans(ticket)) return;
-  if (ticket.gameId || ticket.status !== "resolving") return;
-
-  finalizeMatched(ticket, { gameId, opponentSource: "llm" });
 }
 
 export async function pollMatch(ticketId: string): Promise<MatchStatus> {
@@ -200,7 +175,7 @@ export async function pollMatch(ticketId: string): Promise<MatchStatus> {
     ticket.status === "searching" &&
     (now >= ticket.aiArriveAt || now >= ticket.joinedAt + MATCH_WINDOW_MS)
   ) {
-    await startAiGame(ticket);
+    startAiGame(ticket);
     if (ticket.gameId) {
       return matchedPayload(ticket);
     }
