@@ -1,5 +1,10 @@
 import "dotenv/config";
 
+/**
+ * Secrets are loaded only from process environment (e.g. local `.env` which
+ * is gitignored, or host/CI secret store). They are never embedded in the
+ * client bundle and must never be logged.
+ */
 const AI_API_KEY = process.env.DEFAULT_AI_API_KEY ?? "";
 const AI_BASE_URL = (process.env.DEFAULT_AI_BASE_URL ?? "").replace(/\/+$/, "");
 const AI_MODEL = process.env.DEFAULT_AI_MODEL ?? "";
@@ -15,6 +20,13 @@ interface CallOptions {
   maxTokens?: number;
   temperature?: number;
   timeoutMs?: number;
+}
+
+function redactSecrets(text: string): string {
+  return text
+    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(/sk-[a-zA-Z0-9]+/g, "[REDACTED_KEY]")
+    .replace(/(api[_-]?key["']?\s*[:=]\s*["']?)[^"'\s]+/gi, "$1[REDACTED]");
 }
 
 async function postJson(
@@ -34,12 +46,15 @@ async function postJson(
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      console.error(`[llm] ${url} → http ${res.status}: ${text.slice(0, 200)}`);
+      console.error(
+        `[llm] request failed → http ${res.status}: ${redactSecrets(text).slice(0, 200)}`,
+      );
       return null;
     }
     return await res.json();
   } catch (err) {
-    console.error(`[llm] ${url} → request failed:`, err);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[llm] request failed:`, redactSecrets(msg));
     return null;
   } finally {
     clearTimeout(timer);
@@ -102,7 +117,7 @@ async function tryAnthropic(
 
 /**
  * Single-protocol LLM call (default OpenAI-compatible).
- * Does not blind-fall through both providers — that doubled worst-case latency.
+ * Key is read from env at process start only — never returned to clients.
  */
 export async function callLLM(
   system: string,
@@ -119,4 +134,9 @@ export async function callLLM(
     return tryAnthropic(system, history, next);
   }
   return tryOpenAI(system, history, next);
+}
+
+/** For health checks — never expose the key itself. */
+export function llmConfigured(): boolean {
+  return Boolean(AI_API_KEY && AI_BASE_URL && AI_MODEL);
 }

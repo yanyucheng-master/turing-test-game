@@ -49,8 +49,14 @@ classifyUserAct → emotion → knowledgeBoundary → turnPlan
 - `npm test` — 含协议契约测试
 - `npm run check` — TypeScript
 
+## 密钥安全
+
+- API Key **只**放在本机/服务器环境变量或 gitignored 的 `.env`，**永不**写入前端或仓库
+- 浏览器与 GitHub 上看不到 Key；服务端日志会脱敏
+- `npm run secrets:check` 会扫描已跟踪文件，发现疑似 Key 即失败
+- **无法**做到「程序能调 API，但包括你自己在内任何人都绝对无法访问 Key」——运行时进程必须持有 Key。若 Key 曾出现在聊天/截图中，请到服务商控制台**立刻轮换**
+
 ## 说明
 
 - 对局状态在单进程内存中；多实例无法共享匹配队列
-- `.env` 含密钥，勿提交
 - 更完整的研究说明见对话中的项目评估文档
