@@ -60,13 +60,28 @@ export interface OutboxItem {
   from: "opponent" | "system";
   text: string;
   deliverAt: number;
+  /** Links AI outbox rows to pending transcript events. */
+  transcriptId?: string;
 }
 
 export type ChatCloseReason =
   | "time_limit"
   | "message_limit"
   | "player_judged"
-  | "opponent_judged";
+  | "opponent_judged"
+  | "opponent_left"
+  | "server_error";
+
+/** Timed conversation log — model history uses only visible events. */
+export interface TranscriptEvent {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  /** user accept time, or assistant planned deliverAt */
+  occurredAt: number;
+  state: "pending" | "visible" | "cancelled";
+  outboxSeq?: number;
+}
 
 export interface GameSession {
   id: string;
@@ -80,11 +95,18 @@ export interface GameSession {
   chaos: ChaosLevel;
   roomId: string | null;
   seat: Seat | null;
+  /** Derived cache of visible transcript (role/content only). */
   history: LlmHistoryItem[];
+  /** Source-of-truth timed events for model context ordering. */
+  transcript: TranscriptEvent[];
+  /** Bumped on every accepted player line; invalidates in-flight AI work. */
+  inputRevision: number;
   startedAt: number;
   /** Absolute chat clock bound at match reveal / accept. */
   chatStartedAt: number;
   chatDeadlineAt: number;
+  /** After chat freeze, force a judgment within this deadline. */
+  judgmentDeadlineAt: number | null;
   playerCount: number;
   opponentCount: number;
   finished: boolean;
@@ -111,6 +133,9 @@ export interface GameSession {
   pendingNudges: string[];
   pendingOpener: string | null;
   delayedOpenerAt: number | null;
+  /** Opening style chosen at match commit; generated only after claim. */
+  pendingOpenStyle: "immediate" | "delayed" | "wait" | null;
+  openerStarted: boolean;
 
   /** Unified delivery queue (AI + PvP peer messages). */
   outbox: OutboxItem[];
@@ -119,6 +144,10 @@ export interface GameSession {
   lastScheduledDeliveryAt: number;
   /** Prevent overlapping AI generations. */
   aiJobPending: boolean;
+  /** AbortController for the in-flight LLM call. */
+  llmAbort: AbortController | null;
+  /** Per-game LLM call budget. */
+  llmCallsUsed: number;
   /**
    * Combined player text waiting for one AI turn.
    * User lines are already written to history at accept time.
@@ -128,6 +157,77 @@ export interface GameSession {
   pendingPlayerBurst: string[];
   burstTimer: ReturnType<typeof setTimeout> | null;
   memory: WorkingMemory;
+}
+
+const JUDGMENT_GRACE_MS = 30_000;
+export const MAX_LLM_CALLS_PER_GAME = 40;
+
+export function rebuildHistory(session: GameSession): void {
+  session.history = session.transcript
+    .filter((e) => e.state === "visible")
+    .sort(
+      (a, b) =>
+        a.occurredAt - b.occurredAt || a.id.localeCompare(b.id),
+    )
+    .map((e) => ({ role: e.role, content: e.text }));
+  session.opponentCount = session.transcript.filter(
+    (e) => e.role === "assistant" && e.state === "visible",
+  ).length;
+}
+
+export function appendUserTranscript(
+  session: GameSession,
+  text: string,
+  occurredAt = Date.now(),
+): void {
+  session.transcript.push({
+    id: cryptoRandom(),
+    role: "user",
+    text,
+    occurredAt,
+    state: "visible",
+  });
+  session.inputRevision += 1;
+  rebuildHistory(session);
+}
+
+/** Drop undelivered AI lines and abort in-flight generation. */
+export function cancelPendingAssistant(session: GameSession): void {
+  const now = Date.now();
+  for (const e of session.transcript) {
+    if (e.role === "assistant" && e.state === "pending") {
+      e.state = "cancelled";
+    }
+  }
+  session.outbox = session.outbox.filter(
+    (o) => !(o.from === "opponent" && o.deliverAt > now),
+  );
+  // Drop the typing-delay floor so a cancelled long delay cannot push the next line.
+  session.lastScheduledDeliveryAt = now;
+  if (session.llmAbort) {
+    try {
+      session.llmAbort.abort();
+    } catch {
+      /* ignore */
+    }
+    session.llmAbort = null;
+  }
+  session.pendingOpener = null;
+  session.delayedOpenerAt = null;
+  rebuildHistory(session);
+}
+
+function promoteTranscriptByOutbox(
+  session: GameSession,
+  item: OutboxItem,
+): void {
+  if (item.from !== "opponent" || !item.transcriptId) return;
+  const ev = session.transcript.find((e) => e.id === item.transcriptId);
+  if (!ev || ev.state !== "pending") return;
+  ev.state = "visible";
+  ev.occurredAt = item.deliverAt;
+  rebuildHistory(session);
+  session.lastOpponentActivityAt = Date.now();
 }
 
 /** Freeze chat: no more AI jobs, nudges, or undelivered future outbox. */
@@ -146,16 +246,26 @@ export function closeChat(
     clearTimeout(session.burstTimer);
     session.burstTimer = null;
   }
+  cancelPendingAssistant(session);
   session.pendingOpener = null;
   session.delayedOpenerAt = null;
   session.nextNudgeAt = null;
   session.outbox = session.outbox.filter((e) => e.deliverAt <= now);
   session.lastScheduledDeliveryAt = now;
+  if (
+    !session.judgmentDeadlineAt &&
+    (reason === "time_limit" ||
+      reason === "message_limit" ||
+      reason === "opponent_left")
+  ) {
+    session.judgmentDeadlineAt = now + JUDGMENT_GRACE_MS;
+  }
 }
 
 function closeNoticeFor(reason: ChatCloseReason): string | null {
   if (reason === "time_limit") return "时间到，请做出你的判断";
   if (reason === "message_limit") return "对话已结束，请做出你的判断";
+  if (reason === "opponent_left") return "对方已离开，请做出你的判断";
   return null;
 }
 
@@ -276,13 +386,40 @@ export function enqueueOpponentMessage(
   session: GameSession,
   text: string,
   deliverAt: number,
-): void {
-  enqueueEvent(session, {
+  transcriptId?: string,
+): OutboxItem {
+  return enqueueEvent(session, {
     type: "message",
     from: "opponent",
     text,
     deliverAt: scheduleDeliverAt(session, deliverAt),
+    transcriptId,
   });
+}
+
+/**
+ * Schedule an AI line for later delivery without putting it in model history yet.
+ * Returns false if the input revision already moved on.
+ */
+export function schedulePendingAssistant(
+  session: GameSession,
+  text: string,
+  deliverAt: number,
+  revision: number,
+): boolean {
+  if (revision !== session.inputRevision) return false;
+  if (isChatClosed(session)) return false;
+  const id = cryptoRandom();
+  const row = enqueueOpponentMessage(session, text, deliverAt, id);
+  session.transcript.push({
+    id,
+    role: "assistant",
+    text,
+    occurredAt: row.deliverAt,
+    state: "pending",
+    outboxSeq: row.seq,
+  });
+  return true;
 }
 
 export function enqueueSystemMessage(
@@ -345,6 +482,7 @@ export function peekDueEvents(
   const result: ConversationEvent[] = [];
   for (const e of pending) {
     if (e.deliverAt > now) break;
+    promoteTranscriptByOutbox(session, e);
     result.push({
       seq: e.seq,
       type: e.type,
@@ -381,9 +519,12 @@ export function createAiSession(
     roomId: null,
     seat: null,
     history: [],
+    transcript: [],
+    inputRevision: 0,
     startedAt,
     chatStartedAt: startedAt,
     chatDeadlineAt: startedAt + TIME_LIMIT_SEC * 1000,
+    judgmentDeadlineAt: null,
     playerCount: 0,
     opponentCount: 0,
     finished: false,
@@ -407,10 +548,14 @@ export function createAiSession(
     pendingNudges: [],
     pendingOpener: null,
     delayedOpenerAt: null,
+    pendingOpenStyle: null,
+    openerStarted: false,
     outbox: [],
     outboxSeq: 0,
     lastScheduledDeliveryAt: 0,
     aiJobPending: false,
+    llmAbort: null,
+    llmCallsUsed: 0,
     aiReplyQueue: [],
     pendingPlayerBurst: [],
     burstTimer: null,
@@ -460,9 +605,12 @@ export function createPvpPair(
     chaos: "sane" as const,
     roomId,
     history: [] as LlmHistoryItem[],
+    transcript: [] as TranscriptEvent[],
+    inputRevision: 0,
     startedAt,
     chatStartedAt: startedAt,
     chatDeadlineAt: startedAt + TIME_LIMIT_SEC * 1000,
+    judgmentDeadlineAt: null as number | null,
     playerCount: 0,
     opponentCount: 0,
     finished: false,
@@ -486,10 +634,14 @@ export function createPvpPair(
     pendingNudges: [] as string[],
     pendingOpener: null as string | null,
     delayedOpenerAt: null as number | null,
+    pendingOpenStyle: null as "immediate" | "delayed" | "wait" | null,
+    openerStarted: false,
     outbox: [] as OutboxItem[],
     outboxSeq: 0,
     lastScheduledDeliveryAt: 0,
     aiJobPending: false,
+    llmAbort: null as AbortController | null,
+    llmCallsUsed: 0,
     aiReplyQueue: [] as string[],
     pendingPlayerBurst: [] as string[],
     burstTimer: null as ReturnType<typeof setTimeout> | null,

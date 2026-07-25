@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  appendUserTranscript,
+  cancelPendingAssistant,
   closeChat,
   closeConversation,
   createAiSession,
@@ -8,10 +10,16 @@ import {
   enqueueImmediateSystemMessage,
   isChatClosed,
   peekDueEvents,
+  schedulePendingAssistant,
 } from "./store";
+import { closeChatIfExpired } from "./settle";
 import { queueAiGeneration } from "./aiWorker";
 
-describe("chat freeze + player burst history", () => {
+describe("chat freeze + transcript ordering", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("drops undelivered outbox after closeChat and resets schedule floor", () => {
     const s = createAiSession("freeze1", "human", null);
     const now = Date.now();
@@ -41,6 +49,35 @@ describe("chat freeze + player burst history", () => {
     expect(peekDueEvents(s, 0).map((e) => e.text)).toEqual(["soon"]);
   });
 
+  it("keeps pending AI out of model history until deliverAt", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    const s = createAiSession("hist1", "human", null);
+    appendUserTranscript(s, "你多大", Date.now());
+    schedulePendingAssistant(s, "保密", Date.now() + 5_000, s.inputRevision);
+    appendUserTranscript(s, "哪里人", Date.now() + 100);
+
+    expect(s.history.map((h) => `${h.role}:${h.content}`)).toEqual([
+      "user:你多大",
+      "user:哪里人",
+    ]);
+
+    cancelPendingAssistant(s);
+    expect(s.transcript.some((e) => e.state === "pending")).toBe(false);
+    expect(s.outbox.some((e) => e.from === "opponent")).toBe(false);
+
+    // After cancel + re-schedule, wait past monotonic delivery floor.
+    schedulePendingAssistant(s, "南方", Date.now(), s.inputRevision);
+    vi.setSystemTime(Date.now() + 500);
+    const due = peekDueEvents(s, 0);
+    expect(due.map((e) => e.text)).toContain("南方");
+    expect(s.history.map((h) => `${h.role}:${h.content}`)).toEqual([
+      "user:你多大",
+      "user:哪里人",
+      "assistant:南方",
+    ]);
+  });
+
   it("system notices deliver immediately even after delayed opponent floor", () => {
     const s = createAiSession("sys1", "human", null);
     const now = Date.now();
@@ -64,7 +101,14 @@ describe("chat freeze + player burst history", () => {
     ).toBe(true);
   });
 
-  it("writes rapid player lines to history in UI order before AI reply", () => {
+  it("closeChatIfExpired is false for non-time close reasons", () => {
+    const s = createAiSession("exp1", "human", null);
+    closeChat(s, "message_limit");
+    expect(closeChatIfExpired(s)).toBe(false);
+    expect(s.chatCloseReason).toBe("message_limit");
+  });
+
+  it("writes rapid player lines to transcript in UI order", () => {
     const s = createAiSession("burst1", "human", null);
     queueAiGeneration(s, "你多大");
     queueAiGeneration(s, "哪里人");
@@ -73,7 +117,6 @@ describe("chat freeze + player burst history", () => {
       "user:你多大",
       "user:哪里人",
     ]);
-    expect(s.pendingPlayerBurst).toEqual(["你多大", "哪里人"]);
-    expect(s.aiReplyQueue).toEqual([]);
+    expect(s.inputRevision).toBe(2);
   });
 });

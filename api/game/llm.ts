@@ -10,6 +10,27 @@ const AI_BASE_URL = (process.env.DEFAULT_AI_BASE_URL ?? "").replace(/\/+$/, "");
 const AI_MODEL = process.env.DEFAULT_AI_MODEL ?? "";
 /** Prefer OpenAI-compatible; set LLM_PROTOCOL=anthropic to force Anthropic shape. */
 const AI_PROTOCOL = (process.env.LLM_PROTOCOL ?? "openai").toLowerCase();
+const DISABLE_THINKING =
+  (process.env.LLM_DISABLE_THINKING ?? "true").toLowerCase() !== "false";
+
+const GLOBAL_LLM_CONCURRENCY = 8;
+let activeLlmCalls = 0;
+const llmWaiters: Array<() => void> = [];
+
+async function acquireLlmSlot(): Promise<void> {
+  if (activeLlmCalls < GLOBAL_LLM_CONCURRENCY) {
+    activeLlmCalls += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => llmWaiters.push(resolve));
+  activeLlmCalls += 1;
+}
+
+function releaseLlmSlot(): void {
+  activeLlmCalls = Math.max(0, activeLlmCalls - 1);
+  const next = llmWaiters.shift();
+  if (next) next();
+}
 
 export interface LlmHistoryItem {
   role: "user" | "assistant";
@@ -20,6 +41,7 @@ interface CallOptions {
   maxTokens?: number;
   temperature?: number;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 function redactSecrets(text: string): string {
@@ -34,31 +56,67 @@ async function postJson(
   headers: Record<string, string>,
   body: unknown,
   timeoutMs: number,
+  outerSignal?: AbortSignal,
 ): Promise<unknown | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(
-        `[llm] request failed → http ${res.status}: ${redactSecrets(text).slice(0, 200)}`,
-      );
+  const onOuterAbort = () => controller.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) {
+      clearTimeout(timer);
       return null;
     }
-    return await res.json();
+    outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  try {
+    await acquireLlmSlot();
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(
+          `[llm] request failed → http ${res.status}: ${redactSecrets(text).slice(0, 200)}`,
+        );
+        return null;
+      }
+      return await res.json();
+    } finally {
+      releaseLlmSlot();
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[llm] request failed:`, redactSecrets(msg));
+    if (!/abort/i.test(msg)) {
+      console.error(`[llm] request failed:`, redactSecrets(msg));
+    }
     return null;
   } finally {
     clearTimeout(timer);
+    if (outerSignal) {
+      outerSignal.removeEventListener("abort", onOuterAbort);
+    }
   }
+}
+
+function openAiBody(
+  system: string,
+  history: LlmHistoryItem[],
+  opts: CallOptions,
+) {
+  const body: Record<string, unknown> = {
+    model: AI_MODEL,
+    messages: [{ role: "system", content: system }, ...history],
+    max_tokens: opts.maxTokens ?? 150,
+    temperature: opts.temperature ?? 0.9,
+  };
+  if (DISABLE_THINKING) {
+    body.thinking = { type: "disabled" };
+  }
+  return body;
 }
 
 async function tryOpenAI(
@@ -72,14 +130,9 @@ async function tryOpenAI(
       "Content-Type": "application/json",
       Authorization: `Bearer ${AI_API_KEY}`,
     },
-    {
-      model: AI_MODEL,
-      messages: [{ role: "system", content: system }, ...history],
-      max_tokens: opts.maxTokens ?? 150,
-      temperature: opts.temperature ?? 0.9,
-      thinking: { type: "disabled" },
-    },
-    opts.timeoutMs ?? 8_000,
+    openAiBody(system, history, opts),
+    opts.timeoutMs ?? 5_000,
+    opts.signal,
   )) as { choices?: { message?: { content?: unknown } }[] } | null;
 
   const text = data?.choices?.[0]?.message?.content;
@@ -91,6 +144,16 @@ async function tryAnthropic(
   history: LlmHistoryItem[],
   opts: CallOptions,
 ): Promise<string | null> {
+  const body: Record<string, unknown> = {
+    model: AI_MODEL,
+    system,
+    messages: history,
+    max_tokens: opts.maxTokens ?? 150,
+    temperature: opts.temperature ?? 0.9,
+  };
+  if (DISABLE_THINKING) {
+    body.thinking = { type: "disabled" };
+  }
   const data = (await postJson(
     `${AI_BASE_URL}/messages`,
     {
@@ -99,15 +162,9 @@ async function tryAnthropic(
       Authorization: `Bearer ${AI_API_KEY}`,
       "anthropic-version": "2023-06-01",
     },
-    {
-      model: AI_MODEL,
-      system,
-      messages: history,
-      max_tokens: opts.maxTokens ?? 150,
-      temperature: opts.temperature ?? 0.9,
-      thinking: { type: "disabled" },
-    },
-    opts.timeoutMs ?? 8_000,
+    body,
+    opts.timeoutMs ?? 5_000,
+    opts.signal,
   )) as { content?: { type?: string; text?: unknown }[] } | null;
 
   const block = data?.content?.find((b) => b?.type === "text");
@@ -128,7 +185,8 @@ export async function callLLM(
     console.error("[llm] missing DEFAULT_AI_* credentials");
     return null;
   }
-  const timeoutMs = opts.timeoutMs ?? 8_000;
+  if (opts.signal?.aborted) return null;
+  const timeoutMs = opts.timeoutMs ?? 5_000;
   const next = { ...opts, timeoutMs };
   if (AI_PROTOCOL === "anthropic") {
     return tryAnthropic(system, history, next);
@@ -139,4 +197,10 @@ export async function callLLM(
 /** For health checks — never expose the key itself. */
 export function llmConfigured(): boolean {
   return Boolean(AI_API_KEY && AI_BASE_URL && AI_MODEL);
+}
+
+/** Test helper */
+export function __resetLlmSemaphoreForTests() {
+  activeLlmCalls = 0;
+  llmWaiters.length = 0;
 }

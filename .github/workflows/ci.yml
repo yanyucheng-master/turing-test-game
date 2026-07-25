@@ -18,3 +18,5 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - run: npm run build
+      # lint currently fails on vendored shadcn UI; keep local until cleaned up.

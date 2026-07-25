@@ -217,6 +217,7 @@ function cannedPath(
 export async function generateOpponentTurn(
   session: GameSession,
   playerText: string,
+  opts?: { signal?: AbortSignal },
 ): Promise<GeneratedTurn> {
   const persona = getSocialPersona(session.socialPersonaId);
   harvestUserFacts(session, playerText);
@@ -231,16 +232,21 @@ export async function generateOpponentTurn(
   let parts = cannedPath(session, userAct, plan, persona);
 
   let acceptedPatch: MemoryPatch | undefined;
+  const nearDeadline =
+    Date.now() > session.chatDeadlineAt - 8_000;
 
   if (!parts) {
     const knowledgeNote = `${knowledge.topic}/${knowledge.level} → ${knowledge.behavior}`;
     const system = buildSystemPrompt(persona, plan, session, knowledgeNote);
+    // Only visible transcript — pending delayed AI lines are excluded.
     const history = session.history.slice(-20);
+    session.llmCallsUsed += 1;
     let raw =
       (await callLLM(system, history, {
         maxTokens: 80,
         temperature: 1.0,
-        timeoutMs: 8_000,
+        timeoutMs: 5_000,
+        signal: opts?.signal,
       })) ?? "";
 
     let parsed = parseModelJson(raw);
@@ -261,14 +267,22 @@ export async function generateOpponentTurn(
     let guard = runStyleGuard(parts ?? [], plan, session.memory.usedReplyIds);
     if (
       (!guard.passed || guard.severity === "high") &&
-      INITIAL_CONFIG.maxRewriteAttempts > 0
+      INITIAL_CONFIG.maxRewriteAttempts > 0 &&
+      !nearDeadline &&
+      !opts?.signal?.aborted
     ) {
       acceptedPatch = undefined;
+      session.llmCallsUsed += 1;
       raw =
         (await callLLM(
           system + "\n\n上次输出不合格，请更短、更口语、不要助手腔，只回JSON。",
           history,
-          { maxTokens: 60, temperature: 0.95, timeoutMs: 8_000 },
+          {
+            maxTokens: 60,
+            temperature: 0.95,
+            timeoutMs: 2_000,
+            signal: opts?.signal,
+          },
         )) ?? "";
       parsed = parseModelJson(raw);
       if (!parsed) {
@@ -333,17 +347,24 @@ export async function generateOpponentTurn(
 /** Opening line through the same guard pipeline — never blocks matchmaking. */
 export async function generateOpeningTurn(
   session: GameSession,
+  opts?: { signal?: AbortSignal },
 ): Promise<string> {
   const persona = getSocialPersona(session.socialPersonaId);
   const system = `你是刚匹配到的匿名网友。人设：${persona.identity.blurb}。
 只回一句很短招呼（最多八个字），像微信。不要标点（单独？除外）。不要自我介绍、不要猜对方、不要聊天气。
 只返回JSON：{"replyParts":["招呼"],"memoryPatch":{},"turnAction":"opener"}`;
 
+  session.llmCallsUsed += 1;
   const raw =
     (await callLLM(
       system,
       [{ role: "user", content: "（系统：开场）" }],
-      { maxTokens: 24, temperature: 1.0, timeoutMs: 8_000 },
+      {
+        maxTokens: 24,
+        temperature: 1.0,
+        timeoutMs: 1_500,
+        signal: opts?.signal,
+      },
     )) ?? "";
 
   const parsed = parseModelJson(raw);

@@ -308,8 +308,21 @@ export default function Home() {
           !chatOverRef.current
         ) {
           endChat("时间到，请做出你的判断");
+        } else if (
+          r.chatCloseReason === "message_limit" &&
+          !mustJudgeRef.current &&
+          !chatOverRef.current
+        ) {
+          endChat("对话已结束，请做出你的判断");
+        } else if (
+          r.chatCloseReason === "opponent_left" &&
+          !mustJudgeRef.current &&
+          !chatOverRef.current
+        ) {
+          endChat("对方已离开，请做出你的判断");
         } else if (r.chatLocked) {
           setChatEnded(true);
+          if (r.judgeDeadlineAt) setJudgeDeadlineAt(r.judgeDeadlineAt);
         }
       } catch {
         /* ignore */

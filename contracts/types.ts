@@ -91,8 +91,17 @@ export type EventPullResult =
       chatLocked: boolean;
       mustJudge: boolean;
       judgeDeadlineAt: number | null;
-      /** Server clock says the chat window is over. */
+      /** True only when chat closed due to the wall-clock time limit. */
       expired?: boolean;
+      /** Why chat was frozen, if closed. */
+      chatCloseReason?:
+        | "time_limit"
+        | "message_limit"
+        | "player_judged"
+        | "opponent_judged"
+        | "opponent_left"
+        | "server_error"
+        | null;
     }
   | {
       ok: true;

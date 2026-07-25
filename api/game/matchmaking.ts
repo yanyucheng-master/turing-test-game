@@ -14,9 +14,8 @@ import {
   getRoom,
   getSession,
 } from "./store";
-import { beginSilentMatch } from "./proactive";
 import { pickSocialPersona } from "./socialPersonas";
-import { queueOpeningTurn } from "./aiWorker";
+import { startClaimedOpening } from "./aiWorker";
 
 /**
  * Shared reveal cohorts — every ticket in a cohort reveals at the same
@@ -141,9 +140,24 @@ function cleanupUnclaimedGame(ticket: Ticket): void {
       void markGamesCancelled([ticket.gameId]);
       const peer = getSession(peerId);
       if (peer) {
-        enqueueImmediateSystemMessage(peer, "对方已离开");
-        peer.localNotices.push("对方已离开");
-        closeChat(peer, "message_limit");
+        closeChat(peer, "opponent_left");
+        if (!peer.localNotices.some((n) => n.includes("对方已离开"))) {
+          enqueueImmediateSystemMessage(peer, "对方已离开，请做出你的判断");
+          peer.localNotices.push("对方已离开，请做出你的判断");
+        }
+        // Skip the 20s wait — treat left seat as timed out for settle.
+        if (room && !room.verdicts[session.seat]) {
+          room.verdicts[session.seat] = {
+            guess: null,
+            timedOut: true,
+            at: Date.now(),
+          };
+          if (!room.firstFinisher) {
+            room.firstFinisher = session.seat;
+            room.responseDeadline = Date.now();
+          }
+        }
+        peer.responseDeadline = Date.now();
       }
     } else {
       // Neither side claimed — tear down room and requeue peer.
@@ -205,6 +219,7 @@ export function acceptMatch(ticketId: string, gameId: string): boolean {
     gameId,
     session.opponentSource === "llm" ? "machine" : "human",
   );
+  startClaimedOpening(session);
   return true;
 }
 
@@ -298,15 +313,10 @@ function startAiGame(ticket: Ticket): void {
     ticket.revealAt,
   );
 
+  // Defer LLM/opening until acceptMatch — avoids unclaimed opener cost.
   const roll = Math.random();
-  const openStyle: "immediate" | "delayed" | "wait" =
+  session.pendingOpenStyle =
     roll < 0.4 ? "immediate" : roll < 0.7 ? "delayed" : "wait";
-
-  if (openStyle === "wait") {
-    beginSilentMatch(session);
-  } else {
-    queueOpeningTurn(session, openStyle);
-  }
 }
 
 export async function pollMatch(ticketId: string): Promise<MatchStatus> {

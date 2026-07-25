@@ -30,6 +30,7 @@ import { queueAiGeneration } from "./aiWorker";
 import {
   computeStats,
   maybeTriggerAiEarlyJudge,
+  maybeJudgmentTimeout,
   revealIfReady,
   submitPlayerGuess,
   chatLocked,
@@ -42,6 +43,7 @@ import {
 } from "./settle";
 import { onPlayerActivity, maybeProactiveNudge } from "./proactive";
 import {
+  canRegisterActiveGame,
   checkRateLimit,
   clientIp,
   registerActiveGame,
@@ -76,9 +78,10 @@ export const gameRouter = createRouter({
 
   pollMatch: publicQuery
     .input(z.object({ ticketId: z.string() }))
-    .mutation(async ({ input }): Promise<MatchStatus> =>
-      pollMatch(input.ticketId),
-    ),
+    .mutation(async ({ ctx, input }): Promise<MatchStatus> => {
+      assertRate(clientIp(ctx.req), "poll", 120, 60_000);
+      return pollMatch(input.ticketId);
+    }),
 
   cancelMatch: publicQuery
     .input(z.object({ ticketId: z.string() }))
@@ -91,11 +94,16 @@ export const gameRouter = createRouter({
     .input(z.object({ ticketId: z.string(), gameId: z.string() }))
     .mutation(async ({ ctx, input }) => {
       const ip = clientIp(ctx.req);
-      const ok = acceptMatch(input.ticketId, input.gameId);
-      if (ok && !registerActiveGame(ip, input.gameId)) {
-        // Over concurrent cap — still claimed in-memory; soft-fail new joins later.
+      assertRate(ip, "accept", 20, 60_000);
+      if (!canRegisterActiveGame(ip, input.gameId)) {
+        return { ok: false as const };
       }
-      return { ok };
+      const ok = acceptMatch(input.ticketId, input.gameId);
+      if (!ok) return { ok: false as const };
+      if (!registerActiveGame(ip, input.gameId)) {
+        return { ok: false as const };
+      }
+      return { ok: true as const };
     }),
 
   /**
@@ -245,6 +253,7 @@ export const gameRouter = createRouter({
 
       maybeTriggerAiEarlyJudge(live);
       maybeProactiveNudge(live);
+      maybeJudgmentTimeout(live);
 
       const expired = closeChatIfExpired(live);
 
@@ -270,10 +279,11 @@ export const gameRouter = createRouter({
         phase: "chat",
         cursor,
         events,
-        chatLocked: chatLocked(live) || expired,
+        chatLocked: chatLocked(live) || expired || !!live.chatClosedAt,
         mustJudge: mustJudge(live),
-        judgeDeadlineAt: judgeDeadlineAt(live),
+        judgeDeadlineAt: judgeDeadlineAt(live) ?? live.judgmentDeadlineAt,
         expired,
+        chatCloseReason: live.chatCloseReason,
       };
     }),
 

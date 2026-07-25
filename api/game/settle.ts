@@ -1,4 +1,3 @@
-import { eq } from "drizzle-orm";
 import {
   JUDGE_RESPONSE_SEC,
   type GuessChoice,
@@ -125,18 +124,32 @@ async function persistPlayer(
   guess: GuessChoice | null,
   correct: boolean,
 ) {
+  const persona =
+    session.opponentSource === "llm" ? ("machine" as const) : ("human" as const);
+  const row = {
+    id: session.id,
+    persona,
+    status: "finished" as const,
+    guess,
+    correct,
+    playerMessages: session.playerCount,
+    opponentMessages: opponentMessageCount(session),
+    finishedAt: new Date(),
+  };
   try {
     await getDb()
-      .update(games)
-      .set({
-        status: "finished",
-        guess,
-        correct,
-        playerMessages: session.playerCount,
-        opponentMessages: opponentMessageCount(session),
-        finishedAt: new Date(),
-      })
-      .where(eq(games.id, session.id));
+      .insert(games)
+      .values(row)
+      .onDuplicateKeyUpdate({
+        set: {
+          status: row.status,
+          guess: row.guess,
+          correct: row.correct,
+          playerMessages: row.playerMessages,
+          opponentMessages: row.opponentMessages,
+          finishedAt: row.finishedAt,
+        },
+      });
   } catch (err) {
     console.error("[settle] persist failed:", err);
   }
@@ -287,6 +300,11 @@ export async function revealIfReady(
       return commitReveal(session);
     }
 
+    if (maybeJudgmentTimeout(session)) {
+      if (!session.aiJudgment) session.aiJudgment = flavorJudgePlayer(session);
+      return commitReveal(session);
+    }
+
     return null;
   }
 
@@ -354,7 +372,8 @@ export function submitPlayerGuess(
     }
     // Player first — wait for AI flavor judgment.
     session.waitingForOpponent = true;
-    session.aiReplyAt = Date.now() + (800 + Math.random() * 12_000);
+    // Match human 0–20s judgment window (incl. rare near-timeout).
+    session.aiReplyAt = Date.now() + Math.random() * JUDGE_MS;
     return "waiting";
   }
 
@@ -406,12 +425,24 @@ export function chatLocked(session: GameSession): boolean {
 
 /** Close chat when the absolute deadline is reached (idempotent, both seats). */
 export function closeChatIfExpired(session: GameSession): boolean {
-  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
-    return isChatClosed(session);
+  if (isChatClosed(session)) {
+    return session.chatCloseReason === "time_limit";
   }
+  if (session.myGuess || session.aiJudgedAt) return false;
   // Small network skew only — not a multi-second gameplay extension.
   if (Date.now() < session.chatDeadlineAt + 300) return false;
   closeConversation(session, "time_limit");
+  return true;
+}
+
+/** Force timeout if judgment grace period elapsed after chat freeze. */
+export function maybeJudgmentTimeout(session: GameSession): boolean {
+  if (session.settled || session.myGuess || session.timedOut) return false;
+  if (!session.judgmentDeadlineAt) return false;
+  if (Date.now() < session.judgmentDeadlineAt) return false;
+  session.timedOut = true;
+  session.finished = true;
+  if (!session.chatClosedAt) closeChat(session, "time_limit");
   return true;
 }
 

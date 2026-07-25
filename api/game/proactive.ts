@@ -1,5 +1,8 @@
 import type { GameSession } from "./store";
-import { enqueueOpponentMessage, isChatClosed } from "./store";
+import {
+  isChatClosed,
+  schedulePendingAssistant,
+} from "./store";
 import { scrubReply } from "./personas";
 import { getSocialPersona } from "./socialPersonas";
 import { INITIAL_CONFIG } from "./config";
@@ -99,10 +102,7 @@ function flushDelayedOpener(session: GameSession): void {
   const line = session.pendingOpener;
   session.pendingOpener = null;
   session.delayedOpenerAt = null;
-  session.history.push({ role: "assistant", content: line });
-  session.opponentCount += 1;
-  session.lastOpponentActivityAt = Date.now();
-  enqueueOpponentMessage(session, line, Date.now());
+  schedulePendingAssistant(session, line, Date.now(), session.inputRevision);
   scheduleProactiveNudge(session);
 }
 
@@ -189,11 +189,13 @@ export function maybeProactiveNudge(session: GameSession): void {
     plan,
   });
 
-  session.history.push({ role: "assistant", content: line });
-  session.opponentCount += 1;
-  session.lastOpponentActivityAt = Date.now();
   session.nudgeCount += 1;
-  enqueueOpponentMessage(session, line, Date.now() + Math.min(delay, 2000));
+  schedulePendingAssistant(
+    session,
+    line,
+    Date.now() + Math.min(delay, 2000),
+    session.inputRevision,
+  );
 
   if (session.nudgeCount < persona.tempo.followUpMax && Math.random() < 0.35) {
     scheduleProactiveNudge(session);
