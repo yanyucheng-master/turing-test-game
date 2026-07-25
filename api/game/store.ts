@@ -1,5 +1,6 @@
 import type { GuessChoice, OpponentSource, Persona } from "@contracts/types";
 import type { ConversationEvent } from "@contracts/types";
+import { TIME_LIMIT_SEC } from "@contracts/types";
 import type { ChaosLevel, ReplyPace } from "./personas";
 import type { LlmHistoryItem } from "./llm";
 import { defaultEmotion, type EmotionalState } from "./emotion";
@@ -25,6 +26,9 @@ export interface PvpRoom {
   seats: Record<Seat, string>;
   messages: PvpMessage[];
   startedAt: number;
+  chatStartedAt: number;
+  chatDeadlineAt: number;
+  claims: Record<Seat, boolean>;
   left: Partial<Record<Seat, boolean>>;
   verdicts: Partial<Record<Seat, SeatVerdict>>;
   firstFinisher: Seat | null;
@@ -78,6 +82,9 @@ export interface GameSession {
   seat: Seat | null;
   history: LlmHistoryItem[];
   startedAt: number;
+  /** Absolute chat clock bound at match reveal / accept. */
+  chatStartedAt: number;
+  chatDeadlineAt: number;
   playerCount: number;
   opponentCount: number;
   finished: boolean;
@@ -143,10 +150,72 @@ export function closeChat(
   session.delayedOpenerAt = null;
   session.nextNudgeAt = null;
   session.outbox = session.outbox.filter((e) => e.deliverAt <= now);
+  session.lastScheduledDeliveryAt = now;
+}
+
+function closeNoticeFor(reason: ChatCloseReason): string | null {
+  if (reason === "time_limit") return "时间到，请做出你的判断";
+  if (reason === "message_limit") return "对话已结束，请做出你的判断";
+  return null;
+}
+
+/**
+ * Close AI session, or both seats in a PVP room.
+ * Use for message limit, time limit, and leave — so neither side chats into void.
+ */
+export function closeConversation(
+  session: GameSession,
+  reason: ChatCloseReason,
+): void {
+  if (session.mode === "ai") {
+    closeChat(session, reason);
+    const tip = closeNoticeFor(reason);
+    if (tip && !session.localNotices.some((n) => n === tip)) {
+      enqueueImmediateSystemMessage(session, tip);
+      session.localNotices.push(tip);
+    }
+    return;
+  }
+
+  const room = session.roomId ? rooms.get(session.roomId) : undefined;
+  if (!room) {
+    closeChat(session, reason);
+    return;
+  }
+
+  const tip = closeNoticeFor(reason);
+  for (const seat of ["a", "b"] as const) {
+    const peer = sessions.get(room.seats[seat]);
+    if (!peer) continue;
+    const already = !!peer.chatClosedAt;
+    closeChat(peer, reason);
+    if (!already && tip && !peer.localNotices.some((n) => n === tip)) {
+      enqueueImmediateSystemMessage(peer, tip);
+      peer.localNotices.push(tip);
+    }
+  }
 }
 
 export function isChatClosed(session: GameSession): boolean {
   return !!session.chatClosedAt;
+}
+
+/** Bind absolute chat clock (identity-blind reveal instant). */
+export function bindChatClock(session: GameSession, chatStartedAt: number): void {
+  session.chatStartedAt = chatStartedAt;
+  session.chatDeadlineAt = chatStartedAt + TIME_LIMIT_SEC * 1000;
+  session.startedAt = chatStartedAt;
+  if (session.mode === "ai") {
+    session.aiEarlyJudgeAt = rollAiEarlyJudgeAt(chatStartedAt);
+  }
+  if (session.mode === "pvp" && session.roomId) {
+    const room = rooms.get(session.roomId);
+    if (room) {
+      room.chatStartedAt = chatStartedAt;
+      room.chatDeadlineAt = session.chatDeadlineAt;
+      room.startedAt = chatStartedAt;
+    }
+  }
 }
 
 const sessions = new Map<string, GameSession>();
@@ -229,6 +298,24 @@ export function enqueueSystemMessage(
   });
 }
 
+/** System notices must not inherit typing-delay floors from opponent messages. */
+export function enqueueImmediateSystemMessage(
+  session: GameSession,
+  text: string,
+): void {
+  const now = Date.now();
+  enqueueEvent(session, {
+    type: "system",
+    from: "system",
+    text,
+    deliverAt: now,
+  });
+  session.lastScheduledDeliveryAt = Math.max(
+    session.lastScheduledDeliveryAt,
+    now,
+  );
+}
+
 /** Make all pending outbox items visible now (e.g. when chat locks). */
 export function flushOutbox(session: GameSession): void {
   const now = Date.now();
@@ -295,6 +382,8 @@ export function createAiSession(
     seat: null,
     history: [],
     startedAt,
+    chatStartedAt: startedAt,
+    chatDeadlineAt: startedAt + TIME_LIMIT_SEC * 1000,
     playerCount: 0,
     opponentCount: 0,
     finished: false,
@@ -349,6 +438,9 @@ export function createPvpPair(
     seats: { a: gameIdA, b: gameIdB },
     messages: [],
     startedAt,
+    chatStartedAt: startedAt,
+    chatDeadlineAt: startedAt + TIME_LIMIT_SEC * 1000,
+    claims: { a: false, b: false },
     left: {},
     verdicts: {},
     firstFinisher: null,
@@ -369,6 +461,8 @@ export function createPvpPair(
     roomId,
     history: [] as LlmHistoryItem[],
     startedAt,
+    chatStartedAt: startedAt,
+    chatDeadlineAt: startedAt + TIME_LIMIT_SEC * 1000,
     playerCount: 0,
     opponentCount: 0,
     finished: false,

@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto";
-import {
-  MATCH_WINDOW_SEC,
-  MAX_PLAYER_MESSAGES,
-  TIME_LIMIT_SEC,
-} from "@contracts/types";
+import { MAX_PLAYER_MESSAGES, TIME_LIMIT_SEC } from "@contracts/types";
 import type { MatchStatus, OpponentSource, Persona } from "@contracts/types";
+import { eq } from "drizzle-orm";
 import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
 import {
+  bindChatClock,
+  closeChat,
   createAiSession,
   createPvpPair,
   deleteSession,
+  enqueueImmediateSystemMessage,
   getRoom,
   getSession,
 } from "./store";
@@ -18,19 +18,19 @@ import { beginSilentMatch } from "./proactive";
 import { pickSocialPersona } from "./socialPersonas";
 import { queueOpeningTurn } from "./aiWorker";
 
-const MATCH_WINDOW_MS = MATCH_WINDOW_SEC * 1000;
-/** Identity-blind reveal delay shared by human and AI matches. */
-const MATCH_MASK_MIN_MS = 800;
-const MATCH_MASK_SPAN_MS = 2_200;
+/**
+ * Shared reveal cohorts — every ticket in a cohort reveals at the same
+ * absolute boundary, whether the opponent is human or AI.
+ */
+const COHORT_MS = 4_000;
+const COHORT_MIN_LEAD_MS = 800;
 
 type TicketStatus = "searching" | "resolving" | "matched" | "cancelled";
 
 interface Ticket {
   id: string;
   joinedAt: number;
-  /** Earliest time this ticket may show matched (set at join). */
-  visibleMatchedAt: number;
-  /** Actual reveal time (PVP partners share max of both). */
+  /** Shared cohort boundary for this ticket. */
   revealAt: number;
   status: TicketStatus;
   gameId?: string;
@@ -41,8 +41,8 @@ interface Ticket {
 
 const tickets = new Map<string, Ticket>();
 
-function rollVisibleMatchedAt(joinedAt: number): number {
-  return joinedAt + MATCH_MASK_MIN_MS + Math.random() * MATCH_MASK_SPAN_MS;
+export function calculateCohortRevealAt(joinedAt: number): number {
+  return Math.ceil((joinedAt + COHORT_MIN_LEAD_MS) / COHORT_MS) * COHORT_MS;
 }
 
 function pruneTickets() {
@@ -58,27 +58,60 @@ function isPairable(t: Ticket): boolean {
 }
 
 function searchingPayload(ticket: Ticket, now: number): MatchStatus {
+  const windowMs = Math.max(
+    1_000,
+    ticket.revealAt - ticket.joinedAt,
+  );
   return {
     status: "searching",
-    elapsedMs: Math.min(MATCH_WINDOW_MS, now - ticket.joinedAt),
-    matchWindowSec: MATCH_WINDOW_SEC,
+    elapsedMs: Math.min(windowMs, Math.max(0, now - ticket.joinedAt)),
+    matchWindowSec: Math.max(1, Math.ceil(windowMs / 1000)),
   };
 }
 
 export function joinMatch(): { ticketId: string; joinedAt: number } {
   pruneTickets();
   const joinedAt = Date.now();
-  const visibleMatchedAt = rollVisibleMatchedAt(joinedAt);
+  const revealAt = calculateCohortRevealAt(joinedAt);
   const ticket: Ticket = {
     id: randomUUID(),
     joinedAt,
-    visibleMatchedAt,
-    revealAt: visibleMatchedAt,
+    revealAt,
     status: "searching",
   };
   tickets.set(ticket.id, ticket);
   tryPairHumans(ticket);
   return { ticketId: ticket.id, joinedAt };
+}
+
+async function markGamesCancelled(ids: string[]): Promise<void> {
+  if (!ids.length) return;
+  try {
+    const db = getDb();
+    for (const id of ids) {
+      await db
+        .update(games)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(games.id, id));
+    }
+  } catch (err) {
+    console.error("[match] cancel db update failed:", err);
+  }
+}
+
+function findTicketByGameId(gameId: string): Ticket | undefined {
+  for (const t of tickets.values()) {
+    if (t.gameId === gameId) return t;
+  }
+  return undefined;
+}
+
+function requeueTicket(other: Ticket): void {
+  other.gameId = undefined;
+  other.opponentSource = undefined;
+  other.status = "searching";
+  other.claimedAt = undefined;
+  other.revealAt = calculateCohortRevealAt(Date.now());
 }
 
 function cleanupUnclaimedGame(ticket: Ticket): void {
@@ -91,21 +124,36 @@ function cleanupUnclaimedGame(ticket: Ticket): void {
   }
 
   if (session.mode === "ai") {
-    deleteSession(ticket.gameId);
+    const id = ticket.gameId;
+    deleteSession(id);
+    void markGamesCancelled([id]);
   } else if (session.roomId && session.seat) {
     const room = getRoom(session.roomId);
     const otherSeat = session.seat === "a" ? "b" : "a";
     const peerId = room?.seats[otherSeat];
-    deleteSession(ticket.gameId);
-    if (peerId) deleteSession(peerId);
-    for (const other of tickets.values()) {
-      if (other.id === ticket.id) continue;
-      if (other.gameId !== peerId || other.claimedAt) continue;
-      other.gameId = undefined;
-      other.opponentSource = undefined;
-      other.status = "searching";
-      other.visibleMatchedAt = rollVisibleMatchedAt(Date.now());
-      other.revealAt = other.visibleMatchedAt;
+    const peerTicket = peerId ? findTicketByGameId(peerId) : undefined;
+    const peerClaimed = !!peerTicket?.claimedAt || !!room?.claims[otherSeat];
+
+    if (peerClaimed && peerId) {
+      // Peer already in chat — do NOT delete their session.
+      if (room) room.left[session.seat] = true;
+      deleteSession(ticket.gameId);
+      void markGamesCancelled([ticket.gameId]);
+      const peer = getSession(peerId);
+      if (peer) {
+        enqueueImmediateSystemMessage(peer, "对方已离开");
+        peer.localNotices.push("对方已离开");
+        closeChat(peer, "message_limit");
+      }
+    } else {
+      // Neither side claimed — tear down room and requeue peer.
+      const ids = [ticket.gameId, peerId].filter(Boolean) as string[];
+      deleteSession(ticket.gameId);
+      if (peerId) deleteSession(peerId);
+      void markGamesCancelled(ids);
+      if (peerTicket && peerTicket.id !== ticket.id) {
+        requeueTicket(peerTicket);
+      }
     }
   }
 
@@ -121,20 +169,59 @@ export function cancelMatch(ticketId: string): void {
   t.status = "cancelled";
 }
 
-/** Client handshake after receiving matched — prevents cancel orphans. */
+async function persistGameOnClaim(
+  gameId: string,
+  persona: "human" | "machine",
+): Promise<void> {
+  try {
+    await getDb().insert(games).values({ id: gameId, persona });
+  } catch (err) {
+    const msg = String(err);
+    if (!msg.includes("Duplicate") && !msg.includes("ER_DUP_ENTRY")) {
+      console.error("[match] claim db insert failed:", err);
+    }
+  }
+}
+
+/** Client handshake after receiving matched — also persists DB row. */
 export function acceptMatch(ticketId: string, gameId: string): boolean {
   const t = tickets.get(ticketId);
   if (!t || t.status === "cancelled") return false;
   if (t.gameId !== gameId || t.status !== "matched") return false;
   if (Date.now() < t.revealAt) return false;
+
+  const session = getSession(gameId);
+  if (!session) return false;
+
   t.claimedAt = Date.now();
+  bindChatClock(session, t.revealAt);
+
+  if (session.mode === "pvp" && session.roomId && session.seat) {
+    const room = getRoom(session.roomId);
+    if (room) room.claims[session.seat] = true;
+  }
+
+  void persistGameOnClaim(
+    gameId,
+    session.opponentSource === "llm" ? "machine" : "human",
+  );
   return true;
+}
+
+/** First events/chat acts as claim if acceptMatch was lost on the wire. */
+export function ensureClaimedByGameId(gameId: string): void {
+  const t = findTicketByGameId(gameId);
+  if (!t || t.claimedAt || t.status !== "matched") return;
+  if (Date.now() < t.revealAt) return;
+  acceptMatch(t.id, gameId);
 }
 
 function findPartner(self: Ticket): Ticket | undefined {
   for (const other of tickets.values()) {
     if (other.id === self.id) continue;
     if (!isPairable(other)) continue;
+    // Same cohort only — keeps reveal time identity-blind.
+    if (other.revealAt !== self.revealAt) continue;
     return other;
   }
   return undefined;
@@ -150,17 +237,16 @@ function tryPairHumans(self: Ticket): boolean {
 
   const gameIdA = randomUUID();
   const gameIdB = randomUUID();
-  createPvpPair(gameIdA, gameIdB);
+  const { sessionA, sessionB, room } = createPvpPair(gameIdA, gameIdB);
 
-  void getDb()
-    .insert(games)
-    .values([
-      { id: gameIdA, persona: "human" },
-      { id: gameIdB, persona: "human" },
-    ])
-    .catch((err) => console.error("[match] pvp db insert failed:", err));
+  // Shared cohort boundary for both seats.
+  const activateAt = self.revealAt;
+  bindChatClock(sessionA, activateAt);
+  bindChatClock(sessionB, activateAt);
+  room.chatStartedAt = activateAt;
+  room.chatDeadlineAt = activateAt + TIME_LIMIT_SEC * 1000;
 
-  const activateAt = Math.max(self.visibleMatchedAt, partner.visibleMatchedAt);
+  // DB rows are inserted on accept — avoids active orphans from cancel.
   finalizeMatched(self, { gameId: gameIdA, opponentSource: "player" }, activateAt);
   finalizeMatched(
     partner,
@@ -182,14 +268,11 @@ function finalizeMatched(
 }
 
 /**
- * Commit AI match immediately — never await LLM or DB inside pollMatch.
- * Opening line is generated asynchronously into the outbox.
- * Reveal to client still waits for ticket.revealAt (identity-blind mask).
+ * Commit AI at cohort boundary — never await LLM inside pollMatch.
  */
 function startAiGame(ticket: Ticket): void {
   if (ticket.status !== "searching" || ticket.gameId) return;
 
-  // Last human check before committing AI.
   if (tryPairHumans(ticket)) return;
 
   ticket.status = "resolving";
@@ -207,17 +290,13 @@ function startAiGame(ticket: Ticket): void {
     chaos,
     social.id,
   );
+  bindChatClock(session, ticket.revealAt);
 
   finalizeMatched(
     ticket,
     { gameId, opponentSource: "llm" },
-    ticket.visibleMatchedAt,
+    ticket.revealAt,
   );
-
-  void getDb()
-    .insert(games)
-    .values({ id: gameId, persona: "machine" })
-    .catch((err) => console.error("[match] ai db insert failed:", err));
 
   const roll = Math.random();
   const openStyle: "immediate" | "delayed" | "wait" =
@@ -238,22 +317,21 @@ export async function pollMatch(ticketId: string): Promise<MatchStatus> {
 
   const now = Date.now();
 
+  // Pair humans in the same cohort as early as possible (still hidden).
+  if (ticket.status === "searching") {
+    tryPairHumans(ticket);
+  }
+
   if (ticket.status === "matched" && ticket.gameId) {
     if (now < ticket.revealAt) return searchingPayload(ticket, now);
     return matchedPayload(ticket);
   }
 
-  if (tryPairHumans(ticket)) {
-    if (now < ticket.revealAt) return searchingPayload(ticket, now);
-    return matchedPayload(ticket);
-  }
-
-  // Same decision window for AI as the visible mask — no late 0–10s AI tell.
-  if (
-    ticket.status === "searching" &&
-    (now >= ticket.visibleMatchedAt || now >= ticket.joinedAt + MATCH_WINDOW_MS)
-  ) {
-    startAiGame(ticket);
+  // At cohort boundary: pair or fall back to AI — same reveal instant.
+  if (ticket.status === "searching" && now >= ticket.revealAt) {
+    if (!tryPairHumans(ticket)) {
+      startAiGame(ticket);
+    }
     if (ticket.gameId) {
       if (now < ticket.revealAt) return searchingPayload(ticket, now);
       return matchedPayload(ticket);
@@ -264,11 +342,14 @@ export async function pollMatch(ticketId: string): Promise<MatchStatus> {
 }
 
 function matchedPayload(ticket: Ticket): MatchStatus {
+  const chatStartedAt = ticket.revealAt;
   return {
     status: "matched",
     gameId: ticket.gameId!,
     timeLimitSec: TIME_LIMIT_SEC,
     maxPlayerMessages: MAX_PLAYER_MESSAGES,
+    chatStartedAt,
+    chatDeadlineAt: chatStartedAt + TIME_LIMIT_SEC * 1000,
   };
 }
 
@@ -279,7 +360,6 @@ export function __debugTicket(ticketId: string) {
   return {
     status: t.status,
     joinedAt: t.joinedAt,
-    visibleMatchedAt: t.visibleMatchedAt,
     revealAt: t.revealAt,
     hasGame: !!t.gameId,
     claimed: !!t.claimedAt,

@@ -15,11 +15,10 @@ export interface ChatMessageView {
 }
 
 /**
- * Visible matchmaking window (seconds).
- * Both human and AI matches reveal inside this window with the same mask delay,
- * so elapsed time alone cannot fingerprint opponent identity.
+ * Max visible matchmaking wait (seconds) for UI.
+ * Actual reveal uses shared cohort boundaries so human/AI timing matches.
  */
-export const MATCH_WINDOW_SEC = 3;
+export const MATCH_WINDOW_SEC = 5;
 
 /** After one side judges, the other must answer within this many seconds. */
 export const JUDGE_RESPONSE_SEC = 20;
@@ -46,6 +45,9 @@ export type MatchStatus =
       gameId: string;
       timeLimitSec: number;
       maxPlayerMessages: number;
+      /** Server absolute chat clock — clients must use this, not local Date.now(). */
+      chatStartedAt: number;
+      chatDeadlineAt: number;
     }
   | {
       status: "cancelled";

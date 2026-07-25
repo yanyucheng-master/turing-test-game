@@ -84,14 +84,9 @@ export default function Home() {
     mustJudgeRef.current = true;
     setJudgeDeadlineAt(deadlineAt);
     setChatEnded(true);
+    // Server outbox is the sole source for judge tips — avoid local duplicates.
     if (sysMsgs?.length) {
       setMessages((ms) => [...ms, ...sysMsgs]);
-    } else {
-      setMessages((ms) => {
-        const tip = "对方已提交判断，请在 20 秒内做出你的判断";
-        if (ms.some((m) => m.text.includes("对方已提交判断"))) return ms;
-        return [...ms, { from: "system", text: tip }];
-      });
     }
     setGuessOpen(true);
   };
@@ -99,6 +94,8 @@ export default function Home() {
   const enterChat = (r: {
     gameId: string;
     timeLimitSec: number;
+    chatDeadlineAt?: number;
+    chatStartedAt?: number;
   }) => {
     setGameId(r.gameId);
     eventCursorRef.current = 0;
@@ -112,8 +109,12 @@ export default function Home() {
     mustJudgeRef.current = false;
     setJudgeDeadlineAt(null);
     setJudgeSecondsLeft(null);
-    setDeadline(Date.now() + r.timeLimitSec * 1000);
-    setSecondsLeft(r.timeLimitSec);
+    const deadlineAt =
+      r.chatDeadlineAt ?? Date.now() + r.timeLimitSec * 1000;
+    setDeadline(deadlineAt);
+    setSecondsLeft(
+      Math.max(0, Math.ceil((deadlineAt - Date.now()) / 1000)),
+    );
     setTicketId(null);
     setPhase("chat");
   };
@@ -156,16 +157,25 @@ export default function Home() {
         }
         if (status.status === "searching") {
           setMatchElapsedMs(status.elapsedMs);
+          setMatchWindowSec(status.matchWindowSec);
         } else if (status.status === "matched") {
+          let accepted = false;
           try {
-            await acceptAsyncRef.current({
+            const res = await acceptAsyncRef.current({
               ticketId,
               gameId: status.gameId,
             });
+            accepted = !!res.ok;
           } catch {
-            /* still enter — server may accept on first events */
+            accepted = false;
           }
           if (stopped) return;
+          if (!accepted) {
+            setTicketId(null);
+            setSessionLost(true);
+            setPhase("intro");
+            return;
+          }
           enterChat(status);
           return;
         }

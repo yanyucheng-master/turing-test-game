@@ -11,8 +11,9 @@ import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
 import {
   closeChat,
+  closeConversation,
   deleteSession,
-  enqueueSystemMessage,
+  enqueueImmediateSystemMessage,
   getRoom,
   getSession,
   isChatClosed,
@@ -73,7 +74,8 @@ export async function computeStats(): Promise<GlobalStats> {
 }
 
 function pushNotice(session: GameSession, text: string) {
-  enqueueSystemMessage(session, text);
+  if (session.localNotices.some((n) => n === text)) return;
+  enqueueImmediateSystemMessage(session, text);
   session.localNotices.push(text);
 }
 
@@ -90,7 +92,7 @@ function roomNotice(
   for (const seat of targets) {
     const sid = room.seats[seat];
     const s = getSession(sid);
-    if (s) enqueueSystemMessage(s, text);
+    if (s) pushNotice(s, text);
   }
 }
 
@@ -147,7 +149,7 @@ export function maybeTriggerAiEarlyJudge(session: GameSession): void {
   if (!session.aiEarlyJudgeAt) return;
   if (Date.now() < session.aiEarlyJudgeAt) return;
 
-  const elapsed = Date.now() - session.startedAt;
+  const elapsed = Date.now() - session.chatStartedAt;
   const totalMsgs = session.playerCount + session.opponentCount;
   if (
     elapsed < INITIAL_CONFIG.earlyJudgeMinElapsedMs ||
@@ -402,20 +404,14 @@ export function chatLocked(session: GameSession): boolean {
   return false;
 }
 
-/** Close chat when the wall-clock window ends (idempotent). */
-export function closeChatIfExpired(
-  session: GameSession,
-  startedAt: number,
-  limitSec: number,
-): boolean {
+/** Close chat when the absolute deadline is reached (idempotent, both seats). */
+export function closeChatIfExpired(session: GameSession): boolean {
   if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
     return isChatClosed(session);
   }
-  if ((Date.now() - startedAt) / 1000 <= limitSec + 5) return false;
-  closeChat(session, "time_limit");
-  if (!session.localNotices.some((n) => n.includes("时间到"))) {
-    pushNotice(session, "时间到，请做出你的判断");
-  }
+  // Small network skew only — not a multi-second gameplay extension.
+  if (Date.now() < session.chatDeadlineAt + 300) return false;
+  closeConversation(session, "time_limit");
   return true;
 }
 

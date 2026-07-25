@@ -10,7 +10,7 @@ import {
 export const games = mysqlTable("games", {
   id: varchar("id", { length: 36 }).primaryKey(),
   persona: mysqlEnum("persona", ["human", "machine"]).notNull(),
-  status: mysqlEnum("status", ["active", "finished"])
+  status: mysqlEnum("status", ["active", "finished", "cancelled", "abandoned"])
     .notNull()
     .default("active"),
   guess: mysqlEnum("guess", ["human", "ai"]),

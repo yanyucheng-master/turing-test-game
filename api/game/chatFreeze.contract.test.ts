@@ -1,16 +1,20 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { closeChat, createAiSession, peekDueEvents } from "./store";
+import { describe, expect, it } from "vitest";
+import {
+  closeChat,
+  closeConversation,
+  createAiSession,
+  createPvpPair,
+  enqueueOpponentMessage,
+  enqueueImmediateSystemMessage,
+  isChatClosed,
+  peekDueEvents,
+} from "./store";
 import { queueAiGeneration } from "./aiWorker";
 
 describe("chat freeze + player burst history", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("drops undelivered outbox after closeChat", () => {
+  it("drops undelivered outbox after closeChat and resets schedule floor", () => {
     const s = createAiSession("freeze1", "human", null);
     const now = Date.now();
-    // Bypass scheduleDeliverAt so deliverAt values are exact.
     s.outbox = [
       {
         seq: 1,
@@ -28,11 +32,36 @@ describe("chat freeze + player burst history", () => {
       },
     ];
     s.outboxSeq = 2;
+    s.lastScheduledDeliveryAt = now + 60_000;
 
     closeChat(s, "player_judged");
     expect(s.chatClosedAt).toBeTruthy();
     expect(s.outbox.map((e) => e.text)).toEqual(["soon"]);
+    expect(s.lastScheduledDeliveryAt).toBeLessThanOrEqual(Date.now() + 5);
     expect(peekDueEvents(s, 0).map((e) => e.text)).toEqual(["soon"]);
+  });
+
+  it("system notices deliver immediately even after delayed opponent floor", () => {
+    const s = createAiSession("sys1", "human", null);
+    const now = Date.now();
+    s.lastScheduledDeliveryAt = now + 8_000;
+    enqueueImmediateSystemMessage(s, "对方已提交判断，请在 20 秒内做出你的判断");
+    const due = peekDueEvents(s, 0);
+    expect(due).toHaveLength(1);
+    expect(due[0].text).toContain("对方已提交判断");
+    expect(due[0].deliverAt).toBeLessThanOrEqual(Date.now() + 5);
+  });
+
+  it("closeConversation freezes both PVP seats on message limit", () => {
+    const { sessionA, sessionB } = createPvpPair("pvpA", "pvpB");
+    enqueueOpponentMessage(sessionB, "hi", Date.now() + 30_000);
+    closeConversation(sessionA, "message_limit");
+    expect(isChatClosed(sessionA)).toBe(true);
+    expect(isChatClosed(sessionB)).toBe(true);
+    expect(sessionB.outbox.some((e) => e.text === "hi")).toBe(false);
+    expect(
+      sessionB.localNotices.some((n) => n.includes("对话已结束")),
+    ).toBe(true);
   });
 
   it("writes rapid player lines to history in UI order before AI reply", () => {
@@ -45,7 +74,6 @@ describe("chat freeze + player burst history", () => {
       "user:哪里人",
     ]);
     expect(s.pendingPlayerBurst).toEqual(["你多大", "哪里人"]);
-    // Burst timer pending — not yet one-by-one u1,a1,u2.
     expect(s.aiReplyQueue).toEqual([]);
   });
 });

@@ -7,8 +7,11 @@ import { readFileSync } from "node:fs";
 
 const patterns = [
   /\bsk-[a-zA-Z0-9]{16,}\b/,
-  /DEFAULT_AI_API_KEY\s*=\s*["']?sk-/i,
-  /Bearer\s+sk-[a-zA-Z0-9]+/i,
+  /\bgsk_[a-zA-Z0-9]{16,}\b/,
+  /\bAIza[0-9A-Za-z_-]{20,}\b/,
+  /\bxai-[a-zA-Z0-9]{20,}\b/,
+  /DEFAULT_AI_API_KEY\s*=\s*["']?(sk-|gsk_)/i,
+  /Bearer\s+(sk-|gsk_)[a-zA-Z0-9_-]+/i,
 ];
 
 const files = execSync("git ls-files", { encoding: "utf8" })

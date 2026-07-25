@@ -1,7 +1,7 @@
 import { z } from "zod";
+import { TRPCError } from "@trpc/server";
 import { createRouter, publicQuery } from "../middleware";
 import {
-  TIME_LIMIT_SEC,
   MAX_PLAYER_MESSAGES,
   MATCH_WINDOW_SEC,
   type ChatResult,
@@ -11,7 +11,7 @@ import {
   type EventPullResult,
 } from "@contracts/types";
 import {
-  closeChat,
+  closeConversation,
   getSession,
   getRoom,
   isChatClosed,
@@ -24,6 +24,7 @@ import {
   pollMatch,
   cancelMatch,
   acceptMatch,
+  ensureClaimedByGameId,
 } from "./matchmaking";
 import { queueAiGeneration } from "./aiWorker";
 import {
@@ -40,9 +41,31 @@ import {
   closeChatIfExpired,
 } from "./settle";
 import { onPlayerActivity, maybeProactiveNudge } from "./proactive";
+import {
+  checkRateLimit,
+  clientIp,
+  registerActiveGame,
+  releaseActiveGame,
+} from "./rateLimit";
+
+function assertRate(
+  ip: string,
+  action: string,
+  limit: number,
+  windowMs: number,
+) {
+  if (!checkRateLimit(`${ip}:${action}`, limit, windowMs)) {
+    throw new TRPCError({
+      code: "TOO_MANY_REQUESTS",
+      message: "请求过于频繁，请稍后再试",
+    });
+  }
+}
 
 export const gameRouter = createRouter({
-  joinMatch: publicQuery.mutation(async (): Promise<MatchJoinResult> => {
+  joinMatch: publicQuery.mutation(async ({ ctx }): Promise<MatchJoinResult> => {
+    const ip = clientIp(ctx.req);
+    assertRate(ip, "join", 5, 60_000);
     const { ticketId, joinedAt } = joinMatch();
     return {
       ticketId,
@@ -66,8 +89,12 @@ export const gameRouter = createRouter({
 
   acceptMatch: publicQuery
     .input(z.object({ ticketId: z.string(), gameId: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const ip = clientIp(ctx.req);
       const ok = acceptMatch(input.ticketId, input.gameId);
+      if (ok && !registerActiveGame(ip, input.gameId)) {
+        // Over concurrent cap — still claimed in-memory; soft-fail new joins later.
+      }
       return { ok };
     }),
 
@@ -82,7 +109,13 @@ export const gameRouter = createRouter({
         text: z.string().trim().min(1).max(500),
       }),
     )
-    .mutation(async ({ input }): Promise<ChatResult> => {
+    .mutation(async ({ ctx, input }): Promise<ChatResult> => {
+      const ip = clientIp(ctx.req);
+      assertRate(ip, "chat", 30, 60_000);
+
+      ensureClaimedByGameId(input.gameId);
+      registerActiveGame(ip, input.gameId);
+
       const session = getSession(input.gameId);
       if (!session) {
         if (getSettledResult(input.gameId)) {
@@ -102,16 +135,12 @@ export const gameRouter = createRouter({
         };
       }
 
-      const startedAt =
-        session.mode === "pvp" && session.roomId
-          ? (getRoom(session.roomId)?.startedAt ?? session.startedAt)
-          : session.startedAt;
-      if (closeChatIfExpired(session, startedAt, TIME_LIMIT_SEC)) {
+      if (closeChatIfExpired(session)) {
         return { ok: false, expired: true, chatLocked: true };
       }
 
       if (session.playerCount >= MAX_PLAYER_MESSAGES) {
-        closeChat(session, "message_limit");
+        closeConversation(session, "message_limit");
         return { ok: false, limitReached: true, chatLocked: true };
       }
 
@@ -143,7 +172,7 @@ export const gameRouter = createRouter({
 
       const limitReached = session.playerCount >= MAX_PLAYER_MESSAGES;
       if (limitReached) {
-        closeChat(session, "message_limit");
+        closeConversation(session, "message_limit");
       }
 
       return {
@@ -164,9 +193,13 @@ export const gameRouter = createRouter({
         cursor: z.number().int().min(0).default(0),
       }),
     )
-    .mutation(async ({ input }): Promise<EventPullResult> => {
+    .mutation(async ({ ctx, input }): Promise<EventPullResult> => {
+      ensureClaimedByGameId(input.gameId);
+      registerActiveGame(clientIp(ctx.req), input.gameId);
+
       const cached = getSettledResult(input.gameId);
       if (cached) {
+        releaseActiveGame(clientIp(ctx.req), input.gameId);
         return {
           ok: true,
           phase: "revealed",
@@ -183,6 +216,7 @@ export const gameRouter = createRouter({
 
       const revealed = await revealIfReady(session);
       if (revealed) {
+        releaseActiveGame(clientIp(ctx.req), input.gameId);
         return {
           ok: true,
           phase: "revealed",
@@ -194,6 +228,7 @@ export const gameRouter = createRouter({
 
       const after = getSettledResult(input.gameId);
       if (after) {
+        releaseActiveGame(clientIp(ctx.req), input.gameId);
         return {
           ok: true,
           phase: "revealed",
@@ -211,11 +246,7 @@ export const gameRouter = createRouter({
       maybeTriggerAiEarlyJudge(live);
       maybeProactiveNudge(live);
 
-      const startedAt =
-        live.mode === "pvp" && live.roomId
-          ? (getRoom(live.roomId)?.startedAt ?? live.startedAt)
-          : live.startedAt;
-      const expired = closeChatIfExpired(live, startedAt, TIME_LIMIT_SEC);
+      const expired = closeChatIfExpired(live);
 
       const events = peekDueEvents(live, input.cursor);
       const cursor =
@@ -253,9 +284,12 @@ export const gameRouter = createRouter({
         guess: z.enum(["human", "ai"]),
       }),
     )
-    .mutation(async ({ input }): Promise<FinishResult> => {
+    .mutation(async ({ ctx, input }): Promise<FinishResult> => {
+      ensureClaimedByGameId(input.gameId);
+
       const cached = getSettledResult(input.gameId);
       if (cached) {
+        releaseActiveGame(clientIp(ctx.req), input.gameId);
         return { phase: "revealed", result: cached };
       }
 
@@ -275,7 +309,10 @@ export const gameRouter = createRouter({
 
       if (session.myGuess && session.waitingForOpponent) {
         const revealed = await revealIfReady(session);
-        if (revealed) return { phase: "revealed", result: revealed };
+        if (revealed) {
+          releaseActiveGame(clientIp(ctx.req), input.gameId);
+          return { phase: "revealed", result: revealed };
+        }
         return {
           phase: "waiting",
           deadlineAt: waitingDeadline(session),
@@ -296,6 +333,7 @@ export const gameRouter = createRouter({
 
       const result = await revealIfReady(session);
       if (result) {
+        releaseActiveGame(clientIp(ctx.req), input.gameId);
         return { phase: "revealed", result };
       }
 

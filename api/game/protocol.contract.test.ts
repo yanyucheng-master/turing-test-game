@@ -35,6 +35,8 @@ describe("pre-reveal protocol shapes", () => {
       gameId: "g1",
       timeLimitSec: 120,
       maxPlayerMessages: 12,
+      chatStartedAt: 1_700_000_000_000,
+      chatDeadlineAt: 1_700_000_000_000 + 120_000,
     };
     assertNoIdentityKeys(matched);
     expect("opponentSource" in matched).toBe(false);
