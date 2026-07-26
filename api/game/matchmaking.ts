@@ -20,20 +20,20 @@ import {
 import { pickSocialPersona } from "./socialPersonas";
 import { startClaimedOpening } from "./aiWorker";
 
-/**
- * Shared reveal cohorts — every ticket in a cohort reveals at the same
- * absolute boundary, whether the opponent is human or AI.
- */
-const COHORT_MS = 4_000;
-const COHORT_MIN_LEAD_MS = 800;
+/** Hard ceiling for total match wait (includes cold). */
+export const MATCH_MAX_MS = 7_000;
+/** Random cold window inside the total wait: no PVP pair, no AI. */
+export const COLD_MATCH_MAX_MS = 2_000;
 
 type TicketStatus = "searching" | "resolving" | "matched" | "cancelled";
 
 interface Ticket {
   id: string;
   joinedAt: number;
-  /** Shared cohort boundary for this ticket. */
+  /** When match result may be revealed / AI assigned. */
   revealAt: number;
+  /** Until this instant: searching only — no PVP pair, no AI. */
+  coldUntil: number;
   status: TicketStatus;
   gameId?: string;
   claimedAt?: number;
@@ -43,8 +43,61 @@ interface Ticket {
 
 const tickets = new Map<string, Ticket>();
 
+/** Test hooks — null restores random scheduling. */
+let coldMatchMsOverride: number | null = null;
+let totalMatchMsOverride: number | null = null;
+
+export function __setColdMatchMsForTests(ms: number | null): void {
+  coldMatchMsOverride = ms;
+}
+
+export function __setTotalMatchMsForTests(ms: number | null): void {
+  totalMatchMsOverride = ms;
+}
+
+/**
+ * Random schedule: cold ∈ [0, 2s], total ∈ [cold, 7s].
+ * Total always includes cold and never exceeds MATCH_MAX_MS.
+ */
+function rollMatchSchedule(joinedAt: number): {
+  coldUntil: number;
+  revealAt: number;
+} {
+  const coldMs =
+    coldMatchMsOverride !== null
+      ? Math.min(Math.max(0, coldMatchMsOverride), COLD_MATCH_MAX_MS)
+      : Math.floor(Math.random() * (COLD_MATCH_MAX_MS + 1));
+
+  let totalMs: number;
+  if (totalMatchMsOverride !== null) {
+    totalMs = Math.min(
+      MATCH_MAX_MS,
+      Math.max(coldMs, totalMatchMsOverride),
+    );
+  } else {
+    const extraMax = MATCH_MAX_MS - coldMs;
+    const extraMs = Math.floor(Math.random() * (extraMax + 1));
+    totalMs = coldMs + extraMs;
+  }
+
+  return {
+    coldUntil: joinedAt + coldMs,
+    revealAt: joinedAt + totalMs,
+  };
+}
+
+/** @deprecated Use rollMatchSchedule — kept for older test names. */
 export function calculateCohortRevealAt(joinedAt: number): number {
-  return Math.ceil((joinedAt + COHORT_MIN_LEAD_MS) / COHORT_MS) * COHORT_MS;
+  return joinedAt + MATCH_MAX_MS;
+}
+
+function isWarm(ticket: Ticket, now = Date.now()): boolean {
+  return now >= ticket.coldUntil;
+}
+
+/** Shared reveal/chat start for paired tickets (later personal reveal wins). */
+function activationTime(ticketsToAlign: Ticket[]): number {
+  return Math.max(...ticketsToAlign.map((t) => t.revealAt));
 }
 
 function pruneTickets() {
@@ -54,34 +107,33 @@ function pruneTickets() {
   }
 }
 
-/** Only searching tickets without a committed game can pair. */
-function isPairable(t: Ticket): boolean {
-  return !t.gameId && t.status === "searching";
+/** Only searching tickets past cold window without a committed game can pair. */
+function isPairable(t: Ticket, now = Date.now()): boolean {
+  return !t.gameId && t.status === "searching" && isWarm(t, now);
 }
 
 function searchingPayload(ticket: Ticket, now: number): MatchStatus {
-  const windowMs = Math.max(
-    1_000,
-    ticket.revealAt - ticket.joinedAt,
-  );
   return {
     status: "searching",
-    elapsedMs: Math.min(windowMs, Math.max(0, now - ticket.joinedAt)),
-    matchWindowSec: Math.max(1, Math.ceil(windowMs / 1000)),
+    // UI shows elapsed only — ceiling is not displayed.
+    elapsedMs: Math.max(0, now - ticket.joinedAt),
+    matchWindowSec: Math.ceil(MATCH_MAX_MS / 1000),
   };
 }
 
 export function joinMatch(): { ticketId: string; joinedAt: number } {
   pruneTickets();
   const joinedAt = Date.now();
-  const revealAt = calculateCohortRevealAt(joinedAt);
+  const { coldUntil, revealAt } = rollMatchSchedule(joinedAt);
   const ticket: Ticket = {
     id: randomUUID(),
     joinedAt,
     revealAt,
+    coldUntil,
     status: "searching",
   };
   tickets.set(ticket.id, ticket);
+  // May no-op during cold window — pollMatch retries after warm-up.
   tryPairHumans(ticket);
   return { ticketId: ticket.id, joinedAt };
 }
@@ -109,11 +161,15 @@ function findTicketByGameId(gameId: string): Ticket | undefined {
 }
 
 function requeueTicket(other: Ticket): void {
+  const now = Date.now();
   other.gameId = undefined;
   other.opponentSource = undefined;
   other.status = "searching";
   other.claimedAt = undefined;
-  other.revealAt = calculateCohortRevealAt(Date.now());
+  other.joinedAt = now;
+  const sched = rollMatchSchedule(now);
+  other.revealAt = sched.revealAt;
+  other.coldUntil = sched.coldUntil;
 }
 
 function cleanupUnclaimedGame(ticket: Ticket): void {
@@ -238,20 +294,19 @@ export function ensureClaimedByGameId(gameId: string): void {
   acceptMatch(t.id, gameId);
 }
 
-function findPartner(self: Ticket): Ticket | undefined {
+function findPartner(self: Ticket, now = Date.now()): Ticket | undefined {
   for (const other of tickets.values()) {
     if (other.id === self.id) continue;
-    if (!isPairable(other)) continue;
-    // Same cohort only — keeps reveal time identity-blind.
-    if (other.revealAt !== self.revealAt) continue;
+    if (!isPairable(other, now)) continue;
     return other;
   }
   return undefined;
 }
 
 function tryPairHumans(self: Ticket): boolean {
-  if (!isPairable(self)) return false;
-  const partner = findPartner(self);
+  const now = Date.now();
+  if (!isPairable(self, now)) return false;
+  const partner = findPartner(self, now);
   if (!partner) return false;
 
   self.status = "resolving";
@@ -261,8 +316,8 @@ function tryPairHumans(self: Ticket): boolean {
   const gameIdB = randomUUID();
   const { sessionA, sessionB, room } = createPvpPair(gameIdA, gameIdB);
 
-  // Shared cohort boundary for both seats.
-  const activateAt = self.revealAt;
+  // Shared reveal: later personal schedule wins (identity-blind for the pair).
+  const activateAt = activationTime([self, partner]);
   bindChatClock(sessionA, activateAt);
   bindChatClock(sessionB, activateAt);
   room.chatStartedAt = activateAt;
@@ -290,10 +345,12 @@ function finalizeMatched(
 }
 
 /**
- * Commit AI at cohort boundary — never await LLM inside pollMatch.
+ * Commit AI after personal revealAt (always ≥ coldUntil) — never await LLM.
  */
 function startAiGame(ticket: Ticket): void {
+  const now = Date.now();
   if (ticket.status !== "searching" || ticket.gameId) return;
+  if (!isWarm(ticket, now) || now < ticket.revealAt) return;
 
   if (tryPairHumans(ticket)) return;
 
@@ -312,12 +369,13 @@ function startAiGame(ticket: Ticket): void {
     chaos,
     social.id,
   );
-  bindChatClock(session, ticket.revealAt);
+  const activateAt = activationTime([ticket]);
+  bindChatClock(session, activateAt);
 
   finalizeMatched(
     ticket,
     { gameId, opponentSource: "llm" },
-    ticket.revealAt,
+    activateAt,
   );
 
   // Defer LLM/opening until acceptMatch — avoids unclaimed opener cost.
@@ -334,8 +392,8 @@ export async function pollMatch(ticketId: string): Promise<MatchStatus> {
 
   const now = Date.now();
 
-  // Pair humans in the same cohort as early as possible (still hidden).
-  if (ticket.status === "searching") {
+  // Pair humans only after both sides leave the cold window (still hidden).
+  if (ticket.status === "searching" && isWarm(ticket, now)) {
     tryPairHumans(ticket);
   }
 
@@ -344,8 +402,12 @@ export async function pollMatch(ticketId: string): Promise<MatchStatus> {
     return matchedPayload(ticket);
   }
 
-  // At cohort boundary: pair or fall back to AI — same reveal instant.
-  if (ticket.status === "searching" && now >= ticket.revealAt) {
+  // At personal reveal (≤ 7s, includes cold): pair or fall back to AI.
+  if (
+    ticket.status === "searching" &&
+    now >= ticket.revealAt &&
+    isWarm(ticket, now)
+  ) {
     if (!tryPairHumans(ticket)) {
       startAiGame(ticket);
     }
@@ -378,6 +440,7 @@ export function __debugTicket(ticketId: string) {
     status: t.status,
     joinedAt: t.joinedAt,
     revealAt: t.revealAt,
+    coldUntil: t.coldUntil,
     hasGame: !!t.gameId,
     claimed: !!t.claimedAt,
   };
@@ -386,4 +449,6 @@ export function __debugTicket(ticketId: string) {
 /** Test-only: clear in-memory matchmaking state. */
 export function __resetMatchmakingForTests() {
   tickets.clear();
+  coldMatchMsOverride = null;
+  totalMatchMsOverride = null;
 }

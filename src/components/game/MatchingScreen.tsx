@@ -1,20 +1,11 @@
-import { MATCH_WINDOW_SEC } from "@contracts/types";
-
 interface Props {
   elapsedMs: number;
-  matchWindowSec?: number;
   onCancel: () => void;
 }
 
-export default function MatchingScreen({
-  elapsedMs,
-  matchWindowSec = MATCH_WINDOW_SEC,
-  onCancel,
-}: Props) {
-  const windowMs = matchWindowSec * 1000;
-  const progress = Math.min(1, elapsedMs / windowMs);
-  const sec = Math.min(matchWindowSec, Math.floor(elapsedMs / 1000));
-  const display = sec.toString();
+export default function MatchingScreen({ elapsedMs, onCancel }: Props) {
+  // Count-up only — never show a match ceiling (e.g. "/ 7s").
+  const elapsedLabel = `${(Math.max(0, elapsedMs) / 1000).toFixed(1)}s`;
 
   return (
     <div className="min-h-screen bg-[var(--paper)] text-[var(--ink)] font-sans-x flex flex-col">
@@ -41,22 +32,15 @@ export default function MatchingScreen({
           <div className="mt-12">
             <div className="flex items-baseline justify-between gap-4">
               <span className="font-mono-x text-4xl tracking-tight tabular-nums">
-                {display}
+                {elapsedLabel}
                 <span className="text-base text-[var(--faint)] ml-2">
-                  / {matchWindowSec}s
+                  已等待
                 </span>
               </span>
               <span className="font-mono-x text-[11px] tracking-[0.2em] uppercase text-[var(--faint)] flex items-center gap-2">
                 <span className="live-dot inline-block w-1.5 h-1.5 rounded-full bg-[var(--ink)]" />
                 搜寻对手
               </span>
-            </div>
-
-            <div className="mt-4 h-[2px] bg-[var(--hairline)] overflow-hidden">
-              <div
-                className="h-full bg-[var(--ink)] transition-[width] duration-200 ease-linear"
-                style={{ width: `${progress * 100}%` }}
-              />
             </div>
           </div>
 

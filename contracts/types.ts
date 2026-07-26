@@ -14,11 +14,8 @@ export interface ChatMessageView {
   text: string;
 }
 
-/**
- * Max visible matchmaking wait (seconds) for UI.
- * Actual reveal uses shared cohort boundaries so human/AI timing matches.
- */
-export const MATCH_WINDOW_SEC = 5;
+/** Hard ceiling for matchmaking wait (seconds), including cold match. */
+export const MATCH_WINDOW_SEC = 7;
 
 /** After one side judges, the other must answer within this many seconds. */
 export const JUDGE_RESPONSE_SEC = 20;

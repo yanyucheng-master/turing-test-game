@@ -19,7 +19,6 @@ export default function Home() {
   const [phase, setPhase] = useState<Phase>("intro");
   const [ticketId, setTicketId] = useState<string | null>(null);
   const [matchElapsedMs, setMatchElapsedMs] = useState(0);
-  const [matchWindowSec, setMatchWindowSec] = useState(10);
   const [gameId, setGameId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
   const [deadline, setDeadline] = useState(0);
@@ -123,7 +122,6 @@ export default function Home() {
     joinMut.mutate(undefined, {
       onSuccess: (r) => {
         setTicketId(r.ticketId);
-        setMatchWindowSec(r.matchWindowSec);
         setMatchElapsedMs(0);
         matchJoinedAtRef.current = Date.now();
         setPhase("matching");
@@ -157,7 +155,6 @@ export default function Home() {
         }
         if (status.status === "searching") {
           setMatchElapsedMs(status.elapsedMs);
-          setMatchWindowSec(status.matchWindowSec);
         } else if (status.status === "matched") {
           let accepted = false;
           try {
@@ -192,7 +189,7 @@ export default function Home() {
       if (matchJoinedAtRef.current) {
         setMatchElapsedMs(Date.now() - matchJoinedAtRef.current);
       }
-    }, 500);
+    }, 100);
     return () => {
       stopped = true;
       window.clearTimeout(timer);
@@ -421,7 +418,6 @@ export default function Home() {
     return (
       <MatchingScreen
         elapsedMs={matchElapsedMs}
-        matchWindowSec={matchWindowSec}
         onCancel={cancelMatching}
       />
     );
