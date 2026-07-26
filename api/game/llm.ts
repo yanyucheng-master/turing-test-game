@@ -22,14 +22,17 @@ async function acquireLlmSlot(): Promise<void> {
     activeLlmCalls += 1;
     return;
   }
+  // Waiter inherits the slot via handoff — do not increment again.
   await new Promise<void>((resolve) => llmWaiters.push(resolve));
-  activeLlmCalls += 1;
 }
 
 function releaseLlmSlot(): void {
-  activeLlmCalls = Math.max(0, activeLlmCalls - 1);
   const next = llmWaiters.shift();
-  if (next) next();
+  if (next) {
+    next();
+    return;
+  }
+  activeLlmCalls = Math.max(0, activeLlmCalls - 1);
 }
 
 export interface LlmHistoryItem {

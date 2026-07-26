@@ -16,7 +16,7 @@ import {
   getRoom,
   isChatClosed,
   peekDueEvents,
-  enqueueOpponentMessage,
+  enqueueImmediateOpponentMessage,
   type Seat,
 } from "./store";
 import {
@@ -30,7 +30,6 @@ import { queueAiGeneration } from "./aiWorker";
 import {
   computeStats,
   maybeTriggerAiEarlyJudge,
-  maybeJudgmentTimeout,
   revealIfReady,
   submitPlayerGuess,
   chatLocked,
@@ -122,7 +121,18 @@ export const gameRouter = createRouter({
       assertRate(ip, "chat", 30, 60_000);
 
       ensureClaimedByGameId(input.gameId);
-      registerActiveGame(ip, input.gameId);
+      if (!canRegisterActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
+      }
+      if (!registerActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
+      }
 
       const session = getSession(input.gameId);
       if (!session) {
@@ -168,7 +178,8 @@ export const gameRouter = createRouter({
         room.messages.push({ seat: session.seat, text, at: Date.now() });
         const peer = getSession(room.seats[other]);
         if (peer && !isChatClosed(peer)) {
-          enqueueOpponentMessage(peer, text, Date.now());
+          // Immediate delivery — delayed outbox is wiped by closeConversation.
+          enqueueImmediateOpponentMessage(peer, text);
           peer.opponentCount += 1;
         }
       } else {
@@ -202,12 +213,24 @@ export const gameRouter = createRouter({
       }),
     )
     .mutation(async ({ ctx, input }): Promise<EventPullResult> => {
+      const ip = clientIp(ctx.req);
       ensureClaimedByGameId(input.gameId);
-      registerActiveGame(clientIp(ctx.req), input.gameId);
+      if (!canRegisterActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
+      }
+      if (!registerActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
+      }
 
       const cached = getSettledResult(input.gameId);
       if (cached) {
-        releaseActiveGame(clientIp(ctx.req), input.gameId);
+        releaseActiveGame(ip, input.gameId);
         return {
           ok: true,
           phase: "revealed",
@@ -224,7 +247,7 @@ export const gameRouter = createRouter({
 
       const revealed = await revealIfReady(session);
       if (revealed) {
-        releaseActiveGame(clientIp(ctx.req), input.gameId);
+        releaseActiveGame(ip, input.gameId);
         return {
           ok: true,
           phase: "revealed",
@@ -236,7 +259,7 @@ export const gameRouter = createRouter({
 
       const after = getSettledResult(input.gameId);
       if (after) {
-        releaseActiveGame(clientIp(ctx.req), input.gameId);
+        releaseActiveGame(ip, input.gameId);
         return {
           ok: true,
           phase: "revealed",
@@ -253,7 +276,6 @@ export const gameRouter = createRouter({
 
       maybeTriggerAiEarlyJudge(live);
       maybeProactiveNudge(live);
-      maybeJudgmentTimeout(live);
 
       const expired = closeChatIfExpired(live);
 

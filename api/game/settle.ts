@@ -276,12 +276,43 @@ async function commitReveal(session: GameSession): Promise<GuessResult> {
   return result;
 }
 
+/**
+ * Apply judgment-grace timeouts and write PVP verdicts.
+ * Must only run inside revealIfReady so timeout + settle stay atomic.
+ */
+function applyJudgmentTimeouts(session: GameSession): void {
+  if (session.mode === "ai") {
+    if (session.settled || session.myGuess || session.timedOut) return;
+    if (!session.judgmentDeadlineAt) return;
+    if (Date.now() < session.judgmentDeadlineAt) return;
+    session.timedOut = true;
+    session.finished = true;
+    if (!session.chatClosedAt) closeChat(session, "time_limit");
+    return;
+  }
+
+  if (!session.roomId) return;
+  const room = getRoom(session.roomId);
+  if (!room) return;
+
+  for (const seat of ["a", "b"] as const) {
+    if (room.verdicts[seat]) continue;
+    const s = getSession(room.seats[seat]);
+    if (!s || s.myGuess || s.timedOut) continue;
+    if (!s.judgmentDeadlineAt || Date.now() < s.judgmentDeadlineAt) continue;
+    markPvpTimeout(session.roomId, seat);
+  }
+}
+
 export async function revealIfReady(
   session: GameSession,
 ): Promise<GuessResult | null> {
   const cached = getSettledResult(session.id);
   if (cached) return cached;
   if (session.settled) return buildGuessResult(session);
+
+  // Timeouts are applied here only — never in the router alone.
+  applyJudgmentTimeouts(session);
 
   if (session.mode === "ai") {
     maybeTriggerAiEarlyJudge(session);
@@ -300,7 +331,7 @@ export async function revealIfReady(
       return commitReveal(session);
     }
 
-    if (maybeJudgmentTimeout(session)) {
+    if (session.timedOut) {
       if (!session.aiJudgment) session.aiJudgment = flavorJudgePlayer(session);
       return commitReveal(session);
     }
@@ -435,15 +466,12 @@ export function closeChatIfExpired(session: GameSession): boolean {
   return true;
 }
 
-/** Force timeout if judgment grace period elapsed after chat freeze. */
-export function maybeJudgmentTimeout(session: GameSession): boolean {
-  if (session.settled || session.myGuess || session.timedOut) return false;
-  if (!session.judgmentDeadlineAt) return false;
-  if (Date.now() < session.judgmentDeadlineAt) return false;
-  session.timedOut = true;
-  session.finished = true;
-  if (!session.chatClosedAt) closeChat(session, "time_limit");
-  return true;
+/**
+ * @deprecated Timeouts are applied inside revealIfReady only.
+ * Kept as a no-op so accidental router calls cannot mark timedOut without settle.
+ */
+export function maybeJudgmentTimeout(_session: GameSession): boolean {
+  return false;
 }
 
 export function mustJudge(session: GameSession): boolean {

@@ -159,7 +159,7 @@ export interface GameSession {
   memory: WorkingMemory;
 }
 
-const JUDGMENT_GRACE_MS = 30_000;
+export const JUDGMENT_GRACE_MS = 30_000;
 export const MAX_LLM_CALLS_PER_GAME = 40;
 
 export function rebuildHistory(session: GameSession): void {
@@ -194,13 +194,16 @@ export function appendUserTranscript(
 /** Drop undelivered AI lines and abort in-flight generation. */
 export function cancelPendingAssistant(session: GameSession): void {
   const now = Date.now();
+  const cancelledIds = new Set<string>();
   for (const e of session.transcript) {
     if (e.role === "assistant" && e.state === "pending") {
       e.state = "cancelled";
+      cancelledIds.add(e.id);
     }
   }
+  // Remove by transcriptId — including due-but-not-yet-pulled rows.
   session.outbox = session.outbox.filter(
-    (o) => !(o.from === "opponent" && o.deliverAt > now),
+    (o) => !(o.transcriptId && cancelledIds.has(o.transcriptId)),
   );
   // Drop the typing-delay floor so a cancelled long delay cannot push the next line.
   session.lastScheduledDeliveryAt = now;
@@ -220,14 +223,17 @@ export function cancelPendingAssistant(session: GameSession): void {
 function promoteTranscriptByOutbox(
   session: GameSession,
   item: OutboxItem,
-): void {
-  if (item.from !== "opponent" || !item.transcriptId) return;
+): boolean {
+  if (item.from !== "opponent" || !item.transcriptId) return true;
   const ev = session.transcript.find((e) => e.id === item.transcriptId);
-  if (!ev || ev.state !== "pending") return;
+  if (!ev) return true;
+  if (ev.state === "cancelled") return false;
+  if (ev.state !== "pending") return true;
   ev.state = "visible";
   ev.occurredAt = item.deliverAt;
   rebuildHistory(session);
   session.lastOpponentActivityAt = Date.now();
+  return true;
 }
 
 /** Freeze chat: no more AI jobs, nudges, or undelivered future outbox. */
@@ -397,6 +403,25 @@ export function enqueueOpponentMessage(
   });
 }
 
+/** Human peer messages — no simulated typing delay. */
+export function enqueueImmediateOpponentMessage(
+  session: GameSession,
+  text: string,
+): OutboxItem {
+  const now = Date.now();
+  const row = enqueueEvent(session, {
+    type: "message",
+    from: "opponent",
+    text,
+    deliverAt: now,
+  });
+  session.lastScheduledDeliveryAt = Math.max(
+    session.lastScheduledDeliveryAt,
+    now,
+  );
+  return row;
+}
+
 /**
  * Schedule an AI line for later delivery without putting it in model history yet.
  * Returns false if the input revision already moved on.
@@ -482,7 +507,11 @@ export function peekDueEvents(
   const result: ConversationEvent[] = [];
   for (const e of pending) {
     if (e.deliverAt > now) break;
-    promoteTranscriptByOutbox(session, e);
+    // Skip cancelled AI lines and purge them so they cannot block the cursor.
+    if (!promoteTranscriptByOutbox(session, e)) {
+      session.outbox = session.outbox.filter((o) => o.seq !== e.seq);
+      continue;
+    }
     result.push({
       seq: e.seq,
       type: e.type,

@@ -4,7 +4,9 @@ import type { MatchStatus, OpponentSource, Persona } from "@contracts/types";
 import { eq } from "drizzle-orm";
 import { getDb } from "../queries/connection";
 import { games } from "@db/schema";
+import { JUDGE_RESPONSE_SEC } from "@contracts/types";
 import {
+  JUDGMENT_GRACE_MS,
   bindChatClock,
   closeChat,
   createAiSession,
@@ -145,7 +147,7 @@ function cleanupUnclaimedGame(ticket: Ticket): void {
           enqueueImmediateSystemMessage(peer, "对方已离开，请做出你的判断");
           peer.localNotices.push("对方已离开，请做出你的判断");
         }
-        // Skip the 20s wait — treat left seat as timed out for settle.
+        // Leaver times out; remaining player gets a normal judgment window.
         if (room && !room.verdicts[session.seat]) {
           room.verdicts[session.seat] = {
             guess: null,
@@ -154,10 +156,13 @@ function cleanupUnclaimedGame(ticket: Ticket): void {
           };
           if (!room.firstFinisher) {
             room.firstFinisher = session.seat;
-            room.responseDeadline = Date.now();
           }
+          room.responseDeadline =
+            Date.now() + JUDGE_RESPONSE_SEC * 1000;
         }
-        peer.responseDeadline = Date.now();
+        if (!peer.judgmentDeadlineAt) {
+          peer.judgmentDeadlineAt = Date.now() + JUDGMENT_GRACE_MS;
+        }
       }
     } else {
       // Neither side claimed — tear down room and requeue peer.

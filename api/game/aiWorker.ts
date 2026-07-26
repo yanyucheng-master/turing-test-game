@@ -73,6 +73,21 @@ function unansweredPlayerText(session: GameSession): string {
     .join("\n");
 }
 
+function snapshotMutables(session: GameSession) {
+  return {
+    memory: structuredClone(session.memory),
+    llmCallsUsed: session.llmCallsUsed,
+  };
+}
+
+function restoreMutables(
+  session: GameSession,
+  snap: ReturnType<typeof snapshotMutables>,
+): void {
+  session.memory = snap.memory;
+  session.llmCallsUsed = snap.llmCallsUsed;
+}
+
 function pumpQueue(gameId: string): void {
   const session = getSession(gameId);
   if (!session || session.mode !== "ai") return;
@@ -88,8 +103,10 @@ function pumpQueue(gameId: string): void {
   session.aiJobPending = true;
   const abort = new AbortController();
   session.llmAbort = abort;
+  const mutablesSnap = snapshotMutables(session);
 
   void (async () => {
+    let committed = false;
     try {
       const live = getSession(gameId);
       if (!live || isChatClosed(live) || live.myGuess || live.aiJudgedAt) return;
@@ -117,6 +134,7 @@ function pumpQueue(gameId: string): void {
       if (scheduled) {
         afterAiReply(again);
       }
+      committed = true;
     } catch (err) {
       if (!(err instanceof Error && /abort/i.test(err.message))) {
         console.error("[aiWorker] generation failed:", err);
@@ -124,6 +142,7 @@ function pumpQueue(gameId: string): void {
     } finally {
       const s = getSession(gameId);
       if (s) {
+        if (!committed) restoreMutables(s, mutablesSnap);
         if (s.llmAbort === abort) s.llmAbort = null;
         s.aiJobPending = false;
         pumpQueue(gameId);
