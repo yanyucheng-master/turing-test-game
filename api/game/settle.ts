@@ -382,6 +382,79 @@ export async function revealIfReady(
   return myResult;
 }
 
+export type FinishResolution =
+  | { phase: "revealed"; result: GuessResult }
+  | { phase: "waiting"; deadlineAt: number; message: string }
+  | { phase: "lost"; message: string };
+
+/**
+ * Server-authoritative finish: apply judgment deadlines before accepting a guess.
+ * Must not depend on the client having polled `events`.
+ */
+export async function resolveFinish(
+  session: GameSession,
+  guess: GuessChoice,
+): Promise<FinishResolution> {
+  const pre = await revealIfReady(session);
+  if (pre) return { phase: "revealed", result: pre };
+
+  const live = getSession(session.id);
+  if (!live) {
+    const cached = getSettledResult(session.id);
+    if (cached) return { phase: "revealed", result: cached };
+    return {
+      phase: "lost",
+      message: "对局已失效，请重新开始（不会伪造对方身份）",
+    };
+  }
+
+  if (live.timedOut || live.settled) {
+    const again = await revealIfReady(live);
+    if (again) return { phase: "revealed", result: again };
+    const cached = getSettledResult(live.id);
+    if (cached) return { phase: "revealed", result: cached };
+    return { phase: "lost", message: "对局已超时结束" };
+  }
+
+  if (live.myGuess && live.waitingForOpponent) {
+    return {
+      phase: "waiting",
+      deadlineAt: waitingDeadline(live),
+      message: waitingMessage(),
+    };
+  }
+
+  if (live.myGuess) {
+    const result = await revealIfReady(live);
+    if (result) return { phase: "revealed", result };
+    return { phase: "lost", message: "结算状态异常，请重新开始" };
+  }
+
+  maybeTriggerAiEarlyJudge(live);
+  const phase = submitPlayerGuess(live, guess);
+
+  if (phase === "waiting") {
+    return {
+      phase: "waiting",
+      deadlineAt: waitingDeadline(live),
+      message: waitingMessage(),
+    };
+  }
+
+  const result = await revealIfReady(live);
+  if (result) return { phase: "revealed", result };
+
+  if (live.waitingForOpponent) {
+    return {
+      phase: "waiting",
+      deadlineAt: waitingDeadline(live),
+      message: waitingMessage(),
+    };
+  }
+
+  return { phase: "lost", message: "结算状态异常，请重新开始" };
+}
+
 export function submitPlayerGuess(
   session: GameSession,
   guess: GuessChoice,

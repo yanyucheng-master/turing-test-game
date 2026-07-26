@@ -6,6 +6,11 @@ import type { LlmHistoryItem } from "./llm";
 import { defaultEmotion, type EmotionalState } from "./emotion";
 import { getSocialPersona, pickSocialPersona } from "./socialPersonas";
 import { INITIAL_CONFIG } from "./config";
+import {
+  initialInteractionState,
+  type InteractionState,
+} from "./interactionState";
+import { hashSeed } from "./rng";
 
 export type Seat = "a" | "b";
 
@@ -52,6 +57,8 @@ export interface WorkingMemory {
   accusationCount: number;
   strongChaosTurns: number;
   metaTurns: number;
+  /** Persistent psychological state for strategy selection. */
+  interaction: InteractionState;
 }
 
 export interface OutboxItem {
@@ -157,6 +164,8 @@ export interface GameSession {
   pendingPlayerBurst: string[];
   burstTimer: ReturnType<typeof setTimeout> | null;
   memory: WorkingMemory;
+  /** Seeded PRNG state (mulberry32) — advances per roll. */
+  rngState: number;
 }
 
 export const JUDGMENT_GRACE_MS = 30_000;
@@ -164,12 +173,13 @@ export const MAX_LLM_CALLS_PER_GAME = 40;
 
 export function rebuildHistory(session: GameSession): void {
   session.history = session.transcript
-    .filter((e) => e.state === "visible")
+    .map((e, index) => ({ e, index }))
+    .filter(({ e }) => e.state === "visible")
     .sort(
       (a, b) =>
-        a.occurredAt - b.occurredAt || a.id.localeCompare(b.id),
+        a.e.occurredAt - b.e.occurredAt || a.index - b.index,
     )
-    .map((e) => ({ role: e.role, content: e.text }));
+    .map(({ e }) => ({ role: e.role, content: e.text }));
   session.opponentCount = session.transcript.filter(
     (e) => e.role === "assistant" && e.state === "visible",
   ).length;
@@ -349,7 +359,7 @@ function prune() {
   }
 }
 
-function emptyMemory(): WorkingMemory {
+function emptyMemory(interaction?: InteractionState): WorkingMemory {
   return {
     userFacts: [],
     selfFacts: {},
@@ -360,6 +370,14 @@ function emptyMemory(): WorkingMemory {
     accusationCount: 0,
     strongChaosTurns: 0,
     metaTurns: 0,
+    interaction: interaction ?? {
+      engagement: 0.5,
+      patience: 0.5,
+      guardedness: 0.4,
+      amusement: 0.4,
+      identityProbeStreak: 0,
+      interrogationStreak: 0,
+    },
   };
 }
 
@@ -589,12 +607,14 @@ export function createAiSession(
     pendingPlayerBurst: [],
     burstTimer: null,
     memory: emptyMemory(),
+    rngState: hashSeed(`${id}:${startedAt}`),
   };
   if (session.socialPersonaId) {
     const sp = getSocialPersona(session.socialPersonaId);
     session.memory.selfFacts.ageRange = sp.identity.ageRange;
     session.memory.selfFacts.occupation = sp.identity.occupation;
     session.memory.selfFacts.situation = sp.identity.currentSituation;
+    session.memory.interaction = initialInteractionState(sp);
   }
   sessions.set(id, session);
   return session;
@@ -675,6 +695,7 @@ export function createPvpPair(
     pendingPlayerBurst: [] as string[],
     burstTimer: null as ReturnType<typeof setTimeout> | null,
     memory: emptyMemory(),
+    rngState: hashSeed(`${roomId}:${startedAt}`),
   };
 
   const sessionA: GameSession = {
@@ -684,6 +705,7 @@ export function createPvpPair(
     memory: emptyMemory(),
     outbox: [],
     aiReplyQueue: [],
+    rngState: hashSeed(`${gameIdA}:${startedAt}`),
   };
   const sessionB: GameSession = {
     ...base,
@@ -692,6 +714,7 @@ export function createPvpPair(
     memory: emptyMemory(),
     outbox: [],
     aiReplyQueue: [],
+    rngState: hashSeed(`${gameIdB}:${startedAt}`),
   };
   sessions.set(gameIdA, sessionA);
   sessions.set(gameIdB, sessionB);

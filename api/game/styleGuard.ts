@@ -2,6 +2,29 @@ import { INITIAL_CONFIG } from "./config";
 import { scrubReply } from "./personas";
 import type { TurnPlan } from "./turnPolicy";
 
+/** Strip assistant-ese locally so we can avoid a second LLM rewrite. */
+export function compressAssistantese(parts: string[]): string[] {
+  const cutLead =
+    /^(我理解你的感受[，,]?|听起来你可能是在|这可能意味着|从某种意义上说|需要注意的是|总的来说[，,]?)/;
+  const cutExplain =
+    /(表达了?自己|作为一种比喻|感到被排斥|如果你愿意的话|我可以帮你).*$/;
+
+  return parts
+    .map((p) => {
+      let t = p.trim();
+      t = t.replace(cutLead, "");
+      // Keep first clause when the model starts explaining.
+      if (t.length > 18 && /[，,。；;]/.test(t)) {
+        const first = t.split(/[，,。；;]/)[0]?.trim();
+        if (first && first.length >= 2) t = first;
+      }
+      t = t.replace(cutExplain, "").trim();
+      return t;
+    })
+    .filter(Boolean)
+    .slice(0, INITIAL_CONFIG.maxReplyParts);
+}
+
 const FORBIDDEN = [
   /首先/,
   /其次/,
@@ -76,10 +99,15 @@ export function runStyleGuard(
     }
   }
 
-  let cleaned = parts
-    .map((p) => scrubReply(p))
-    .map((p) => p.trim())
-    .filter(Boolean);
+  let cleaned = compressAssistantese(
+    parts.map((p) => scrubReply(p)).map((p) => p.trim()).filter(Boolean),
+  );
+
+  if (plan.strategy === "react_only" || plan.targetLength === "tiny") {
+    cleaned = cleaned.slice(0, 1).map((p) =>
+      p.length > plan.maxChars ? p.slice(0, plan.maxChars) : p,
+    );
+  }
 
   if (cleaned.length > INITIAL_CONFIG.maxReplyParts) {
     cleaned = cleaned.slice(0, INITIAL_CONFIG.maxReplyParts);

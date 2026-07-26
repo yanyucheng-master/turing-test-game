@@ -177,9 +177,21 @@ export function maybeProactiveNudge(session: GameSession): void {
   }
 
   const knowledge = decideKnowledgeBoundary(persona, line);
+  const analysis = {
+    primaryAct: "short_reaction" as const,
+    oddness: 0,
+    ambiguity: 0,
+    playfulness: 0.2,
+    hostility: 0,
+    identityProbe: 0,
+    personalIntrusion: 0,
+    emotionalDisclosure: 0,
+    confidence: 0.9,
+  };
   const plan = buildTurnPlan({
     session,
     userAct: "short_reaction",
+    analysis,
     knowledge,
   });
   const delay = calculateReplyDelay({
@@ -187,6 +199,8 @@ export function maybeProactiveNudge(session: GameSession): void {
     persona,
     act: "short_reaction",
     plan,
+    analysis,
+    session,
   });
 
   session.nudgeCount += 1;

@@ -7,53 +7,12 @@ import {
   isChatClosed,
   schedulePendingAssistant,
 } from "./store";
-import { generateOpponentTurn, generateOpeningTurn } from "./generateTurn";
+import { generateOpponentTurn, pickOpeningLine } from "./generateTurn";
 import { afterAiReply, beginSilentMatch, holdDelayedOpener } from "./proactive";
 import { fallbackOpener } from "./personas";
-import {
-  getSocialPersona,
-  type PersonaCluster,
-} from "./socialPersonas";
+import { nextRng } from "./rng";
 
 const BURST_MS = 350;
-const OPENER_WAIT_MS = 1_500;
-
-const CLUSTER_OPENERS: Record<PersonaCluster, string[]> = {
-  campus_night: ["嗨", "还没睡啊", "哈喽"],
-  slow_observer: ["嗯你好", "嗨"],
-  tired_worker: ["在", "刚下班"],
-  commute_fragment: ["在", "嗨"],
-  teasing_friend: ["哈喽", "嘿"],
-  cautious_guard: ["你好", "嗨"],
-  high_social: ["哈喽", "终于匹配上了"],
-  cold_low_interest: ["在", "嗯"],
-  creative_procrastinator: ["嗨", "摸鱼吗"],
-  night_shift: ["在", "还醒着"],
-};
-
-function personaOpeningFallback(session: GameSession): string {
-  const persona = getSocialPersona(session.socialPersonaId);
-  const pool = CLUSTER_OPENERS[persona.cluster] ?? ["嗨"];
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<null> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) {
-      resolve(null);
-      return;
-    }
-    const t = setTimeout(() => resolve(null), ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        resolve(null);
-      },
-      { once: true },
-    );
-  });
-}
 
 function unansweredPlayerText(session: GameSession): string {
   const visible = session.transcript
@@ -73,19 +32,16 @@ function unansweredPlayerText(session: GameSession): string {
     .join("\n");
 }
 
-function snapshotMutables(session: GameSession) {
-  return {
-    memory: structuredClone(session.memory),
-    llmCallsUsed: session.llmCallsUsed,
-  };
+function snapshotMemory(session: GameSession) {
+  return structuredClone(session.memory);
 }
 
-function restoreMutables(
+function restoreMemory(
   session: GameSession,
-  snap: ReturnType<typeof snapshotMutables>,
+  memory: ReturnType<typeof snapshotMemory>,
 ): void {
-  session.memory = snap.memory;
-  session.llmCallsUsed = snap.llmCallsUsed;
+  // Keep llmCallsUsed — cancelled calls still consumed budget / slots.
+  session.memory = memory;
 }
 
 function pumpQueue(gameId: string): void {
@@ -103,7 +59,7 @@ function pumpQueue(gameId: string): void {
   session.aiJobPending = true;
   const abort = new AbortController();
   session.llmAbort = abort;
-  const mutablesSnap = snapshotMutables(session);
+  const memorySnap = snapshotMemory(session);
 
   void (async () => {
     let committed = false;
@@ -142,7 +98,7 @@ function pumpQueue(gameId: string): void {
     } finally {
       const s = getSession(gameId);
       if (s) {
-        if (!committed) restoreMutables(s, mutablesSnap);
+        if (!committed) restoreMemory(s, memorySnap);
         if (s.llmAbort === abort) s.llmAbort = null;
         s.aiJobPending = false;
         pumpQueue(gameId);
@@ -189,10 +145,7 @@ export function queueAiGeneration(
   );
 }
 
-/**
- * Opening is started only after acceptMatch (or auto-claim).
- * Cap LLM wait at 1.5s and abort the underlying request on timeout.
- */
+/** Local openers only — no LLM call on match claim. */
 export function queueOpeningTurn(
   session: GameSession,
   openStyle: "immediate" | "delayed",
@@ -200,59 +153,34 @@ export function queueOpeningTurn(
   if (session.openerStarted) return;
   session.openerStarted = true;
   const gameId = session.id;
-  const abort = new AbortController();
-  session.llmAbort = abort;
 
-  void (async () => {
-    try {
-      const live = getSession(gameId);
-      if (!live || live.mode !== "ai" || isChatClosed(live)) return;
-      if (live.lastPlayerActivityAt > 0 || live.playerCount > 0) return;
+  try {
+    const live = getSession(gameId);
+    if (!live || live.mode !== "ai" || isChatClosed(live)) return;
+    if (live.lastPlayerActivityAt > 0 || live.playerCount > 0) return;
 
-      let opener: string | null = null;
-      try {
-        opener = await Promise.race([
-          generateOpeningTurn(live, { signal: abort.signal }).then((o) =>
-            o?.trim() ? o : null,
-          ),
-          delay(OPENER_WAIT_MS, abort.signal).then(() => {
-            abort.abort();
-            return null;
-          }),
-        ]);
-      } catch {
-        opener = null;
-      }
-      if (!opener?.trim()) opener = personaOpeningFallback(live);
+    const opener = pickOpeningLine(live);
+    if (live.pendingOpener || live.opponentCount > 0) return;
+    if (live.inputRevision !== 0) return;
 
-      const again = getSession(gameId);
-      if (!again || isChatClosed(again)) return;
-      if (again.lastPlayerActivityAt > 0 || again.playerCount > 0) return;
-      if (again.pendingOpener || again.opponentCount > 0) return;
-      if (again.inputRevision !== 0) return;
-
-      const noticeMs =
-        openStyle === "immediate"
-          ? 400 + Math.random() * 1_200
-          : 2_500 + Math.random() * 6_000;
-      holdDelayedOpener(again, opener, noticeMs);
-    } catch (err) {
-      console.error("[aiWorker] opening failed:", err);
-      const again = getSession(gameId);
-      if (
-        again &&
-        !isChatClosed(again) &&
-        again.playerCount === 0 &&
-        !again.pendingOpener &&
-        again.opponentCount === 0
-      ) {
-        holdDelayedOpener(again, fallbackOpener(again.persona), 400);
-      }
-    } finally {
-      const s = getSession(gameId);
-      if (s && s.llmAbort === abort) s.llmAbort = null;
+    const noticeMs =
+      openStyle === "immediate"
+        ? 400 + nextRng(live) * 1_200
+        : 2_500 + nextRng(live) * 6_000;
+    holdDelayedOpener(live, opener, noticeMs);
+  } catch (err) {
+    console.error("[aiWorker] opening failed:", err);
+    const again = getSession(gameId);
+    if (
+      again &&
+      !isChatClosed(again) &&
+      again.playerCount === 0 &&
+      !again.pendingOpener &&
+      again.opponentCount === 0
+    ) {
+      holdDelayedOpener(again, fallbackOpener(again.persona), 400);
     }
-  })();
+  }
 }
 
 /** Kick opening / silent wait after the client has claimed the match. */

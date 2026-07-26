@@ -3,12 +3,16 @@ import { runStyleGuard } from "./styleGuard";
 import type { TurnPlan } from "./turnPolicy";
 
 const plan: TurnPlan = {
+  strategy: "direct",
   answerMode: "direct",
   stance: "neutral",
   relationshipAction: "none",
   outputShape: "single",
   targetLength: "short",
   emotionalTone: "neutral",
+  interpretationMode: "literal",
+  allowQuestion: false,
+  maxChars: 22,
 };
 
 describe("styleGuard hard gate", () => {

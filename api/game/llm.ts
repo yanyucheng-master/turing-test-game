@@ -14,22 +14,70 @@ const DISABLE_THINKING =
   (process.env.LLM_DISABLE_THINKING ?? "true").toLowerCase() !== "false";
 
 const GLOBAL_LLM_CONCURRENCY = 8;
+const MAX_LLM_WAITERS = 64;
 let activeLlmCalls = 0;
-const llmWaiters: Array<() => void> = [];
 
-async function acquireLlmSlot(): Promise<void> {
+interface LlmWaiter {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  onAbort?: () => void;
+  signal?: AbortSignal;
+}
+
+const llmWaiters: LlmWaiter[] = [];
+
+class LlmSlotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LlmSlotError";
+  }
+}
+
+async function acquireLlmSlot(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new LlmSlotError("aborted");
+  }
   if (activeLlmCalls < GLOBAL_LLM_CONCURRENCY) {
     activeLlmCalls += 1;
     return;
   }
-  // Waiter inherits the slot via handoff — do not increment again.
-  await new Promise<void>((resolve) => llmWaiters.push(resolve));
+  if (llmWaiters.length >= MAX_LLM_WAITERS) {
+    throw new LlmSlotError("queue_full");
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const waiter: LlmWaiter = {
+      resolve: () => {
+        if (waiter.signal && waiter.onAbort) {
+          waiter.signal.removeEventListener("abort", waiter.onAbort);
+        }
+        resolve();
+      },
+      reject: (err) => {
+        if (waiter.signal && waiter.onAbort) {
+          waiter.signal.removeEventListener("abort", waiter.onAbort);
+        }
+        reject(err);
+      },
+      signal,
+    };
+    if (signal) {
+      waiter.onAbort = () => {
+        const idx = llmWaiters.indexOf(waiter);
+        if (idx >= 0) llmWaiters.splice(idx, 1);
+        waiter.reject(new LlmSlotError("aborted"));
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    llmWaiters.push(waiter);
+  });
 }
 
 function releaseLlmSlot(): void {
   const next = llmWaiters.shift();
   if (next) {
-    next();
+    // Handoff: waiter inherits the active slot count.
+    next.resolve();
     return;
   }
   activeLlmCalls = Math.max(0, activeLlmCalls - 1);
@@ -71,33 +119,35 @@ async function postJson(
     }
     outerSignal.addEventListener("abort", onOuterAbort, { once: true });
   }
+  let acquired = false;
   try {
-    await acquireLlmSlot();
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        console.error(
-          `[llm] request failed → http ${res.status}: ${redactSecrets(text).slice(0, 200)}`,
-        );
-        return null;
-      }
-      return await res.json();
-    } finally {
-      releaseLlmSlot();
+    await acquireLlmSlot(outerSignal);
+    acquired = true;
+    if (outerSignal?.aborted || controller.signal.aborted) {
+      return null;
     }
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(
+        `[llm] request failed → http ${res.status}: ${redactSecrets(text).slice(0, 200)}`,
+      );
+      return null;
+    }
+    return await res.json();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!/abort/i.test(msg)) {
+    if (!/abort|queue_full/i.test(msg)) {
       console.error(`[llm] request failed:`, redactSecrets(msg));
     }
     return null;
   } finally {
+    if (acquired) releaseLlmSlot();
     clearTimeout(timer);
     if (outerSignal) {
       outerSignal.removeEventListener("abort", onOuterAbort);

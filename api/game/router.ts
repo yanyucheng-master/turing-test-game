@@ -31,7 +31,7 @@ import {
   computeStats,
   maybeTriggerAiEarlyJudge,
   revealIfReady,
-  submitPlayerGuess,
+  resolveFinish,
   chatLocked,
   mustJudge,
   judgeDeadlineAt,
@@ -59,6 +59,15 @@ function assertRate(
     throw new TRPCError({
       code: "TOO_MANY_REQUESTS",
       message: "请求过于频繁，请稍后再试",
+    });
+  }
+}
+
+function assertActiveGameSlot(ip: string, gameId: string): void {
+  if (!canRegisterActiveGame(ip, gameId)) {
+    throw new TRPCError({
+      code: "TOO_MANY_REQUESTS",
+      message: "同时进行的对局过多",
     });
   }
 }
@@ -120,19 +129,9 @@ export const gameRouter = createRouter({
       const ip = clientIp(ctx.req);
       assertRate(ip, "chat", 30, 60_000);
 
+      // Gate before auto-claim so a 3rd game cannot start AI openers / DB writes.
+      assertActiveGameSlot(ip, input.gameId);
       ensureClaimedByGameId(input.gameId);
-      if (!canRegisterActiveGame(ip, input.gameId)) {
-        throw new TRPCError({
-          code: "TOO_MANY_REQUESTS",
-          message: "同时进行的对局过多",
-        });
-      }
-      if (!registerActiveGame(ip, input.gameId)) {
-        throw new TRPCError({
-          code: "TOO_MANY_REQUESTS",
-          message: "同时进行的对局过多",
-        });
-      }
 
       const session = getSession(input.gameId);
       if (!session) {
@@ -140,6 +139,13 @@ export const gameRouter = createRouter({
           return { ok: false, chatLocked: true };
         }
         return { ok: false, sessionLost: true };
+      }
+
+      if (!registerActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
       }
 
       maybeTriggerAiEarlyJudge(session);
@@ -214,19 +220,8 @@ export const gameRouter = createRouter({
     )
     .mutation(async ({ ctx, input }): Promise<EventPullResult> => {
       const ip = clientIp(ctx.req);
+      assertActiveGameSlot(ip, input.gameId);
       ensureClaimedByGameId(input.gameId);
-      if (!canRegisterActiveGame(ip, input.gameId)) {
-        throw new TRPCError({
-          code: "TOO_MANY_REQUESTS",
-          message: "同时进行的对局过多",
-        });
-      }
-      if (!registerActiveGame(ip, input.gameId)) {
-        throw new TRPCError({
-          code: "TOO_MANY_REQUESTS",
-          message: "同时进行的对局过多",
-        });
-      }
 
       const cached = getSettledResult(input.gameId);
       if (cached) {
@@ -243,6 +238,13 @@ export const gameRouter = createRouter({
       const session = getSession(input.gameId);
       if (!session) {
         return { ok: false, sessionLost: true };
+      }
+
+      if (!registerActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
       }
 
       const revealed = await revealIfReady(session);
@@ -317,11 +319,13 @@ export const gameRouter = createRouter({
       }),
     )
     .mutation(async ({ ctx, input }): Promise<FinishResult> => {
+      const ip = clientIp(ctx.req);
+      assertActiveGameSlot(ip, input.gameId);
       ensureClaimedByGameId(input.gameId);
 
       const cached = getSettledResult(input.gameId);
       if (cached) {
-        releaseActiveGame(clientIp(ctx.req), input.gameId);
+        releaseActiveGame(ip, input.gameId);
         return { phase: "revealed", result: cached };
       }
 
@@ -339,48 +343,18 @@ export const gameRouter = createRouter({
         };
       }
 
-      if (session.myGuess && session.waitingForOpponent) {
-        const revealed = await revealIfReady(session);
-        if (revealed) {
-          releaseActiveGame(clientIp(ctx.req), input.gameId);
-          return { phase: "revealed", result: revealed };
-        }
-        return {
-          phase: "waiting",
-          deadlineAt: waitingDeadline(session),
-          message: waitingMessage(),
-        };
+      if (!registerActiveGame(ip, input.gameId)) {
+        throw new TRPCError({
+          code: "TOO_MANY_REQUESTS",
+          message: "同时进行的对局过多",
+        });
       }
 
-      maybeTriggerAiEarlyJudge(session);
-      const phase = submitPlayerGuess(session, input.guess);
-
-      if (phase === "waiting") {
-        return {
-          phase: "waiting",
-          deadlineAt: waitingDeadline(session),
-          message: waitingMessage(),
-        };
+      const outcome = await resolveFinish(session, input.guess);
+      if (outcome.phase === "revealed") {
+        releaseActiveGame(ip, input.gameId);
       }
-
-      const result = await revealIfReady(session);
-      if (result) {
-        releaseActiveGame(clientIp(ctx.req), input.gameId);
-        return { phase: "revealed", result };
-      }
-
-      if (session.waitingForOpponent) {
-        return {
-          phase: "waiting",
-          deadlineAt: waitingDeadline(session),
-          message: waitingMessage(),
-        };
-      }
-
-      return {
-        phase: "lost",
-        message: "结算状态异常，请重新开始",
-      };
+      return outcome;
     }),
 
   stats: publicQuery.query(async () => computeStats()),

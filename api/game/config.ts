@@ -24,5 +24,6 @@ export const INITIAL_CONFIG = {
   earlyJudgeMinTotalMessages: 6,
 
   maxMetaConversationTurns: 2,
-  maxRewriteAttempts: 1,
+  /** Prefer local compression / persona fallback over a second LLM call. */
+  maxRewriteAttempts: 0,
 } as const;
