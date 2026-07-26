@@ -1,16 +1,18 @@
 import "dotenv/config";
 
-function required(name: string): string {
-  const value = process.env[name];
-  if (!value && process.env.NODE_ENV === "production") {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value ?? "";
+function optional(name: string, fallback = ""): string {
+  return process.env[name] ?? fallback;
 }
 
 export const env = {
-  appId: required("APP_ID"),
-  appSecret: required("APP_SECRET"),
+  /** Reserved; not required for gameplay. */
+  appId: optional("APP_ID", "turing-test"),
+  appSecret: optional("APP_SECRET", "dev-only-not-a-secret"),
   isProduction: process.env.NODE_ENV === "production",
-  databaseUrl: required("DATABASE_URL"),
+  /** Empty = skip MySQL; match/chat/finish still work in memory. */
+  databaseUrl: optional("DATABASE_URL"),
 };
+
+export function hasDatabase(): boolean {
+  return Boolean(env.databaseUrl.trim());
+}

@@ -13,7 +13,7 @@
 
 ```bash
 cp .env.example .env
-# 填写 DEFAULT_AI_* ；DATABASE_URL 可空（匹配/聊天仍可跑）
+# 填写 DEFAULT_AI_* ；DATABASE_URL 可空（匹配/聊天/结算仍可跑，仅无持久统计）
 npm install
 npm run dev
 ```

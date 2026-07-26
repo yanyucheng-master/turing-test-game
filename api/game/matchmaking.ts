@@ -3,6 +3,7 @@ import { MAX_PLAYER_MESSAGES, TIME_LIMIT_SEC } from "@contracts/types";
 import type { MatchStatus, OpponentSource, Persona } from "@contracts/types";
 import { eq } from "drizzle-orm";
 import { getDb } from "../queries/connection";
+import { hasDatabase } from "../lib/env";
 import { games } from "@db/schema";
 import { JUDGE_RESPONSE_SEC } from "@contracts/types";
 import {
@@ -86,7 +87,7 @@ export function joinMatch(): { ticketId: string; joinedAt: number } {
 }
 
 async function markGamesCancelled(ids: string[]): Promise<void> {
-  if (!ids.length) return;
+  if (!ids.length || !hasDatabase()) return;
   try {
     const db = getDb();
     for (const id of ids) {
@@ -192,6 +193,7 @@ async function persistGameOnClaim(
   gameId: string,
   persona: "human" | "machine",
 ): Promise<void> {
+  if (!hasDatabase()) return;
   try {
     await getDb().insert(games).values({ id: gameId, persona });
   } catch (err) {

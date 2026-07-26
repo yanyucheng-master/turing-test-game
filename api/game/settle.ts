@@ -7,6 +7,7 @@ import {
   type Persona,
 } from "@contracts/types";
 import { getDb } from "../queries/connection";
+import { hasDatabase } from "../lib/env";
 import { games } from "@db/schema";
 import {
   closeChat,
@@ -49,6 +50,9 @@ export function truthOf(
 }
 
 export async function computeStats(): Promise<GlobalStats> {
+  if (!hasDatabase()) {
+    return { totalGames: 0, correctRate: 0, aiShare: 0 };
+  }
   try {
     const rows = await getDb()
       .select({ persona: games.persona, correct: games.correct })
@@ -136,6 +140,7 @@ async function persistPlayer(
     opponentMessages: opponentMessageCount(session),
     finishedAt: new Date(),
   };
+  if (!hasDatabase()) return;
   try {
     await getDb()
       .insert(games)
