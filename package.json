@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && esbuild api/boot.ts --platform=node --bundle --format=esm --outdir=dist --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\"",
+    "build": "vite build && node scripts/check-public-admin-isolation.mjs && esbuild api/boot.ts --platform=node --bundle --format=esm --outdir=dist --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\"",
+    "build:admin": "vite build --config vite.admin.config.ts && esbuild admin/localServer.ts --platform=node --bundle --format=esm --outfile=dist/admin-server.js --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\"",
+    "admin": "npm run build:admin && node dist/admin-server.js",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "NODE_ENV=production node dist/boot.js",

@@ -65,6 +65,13 @@ export default function IntroScreen({ starting, onStart }: Props) {
             ))}
           </div>
 
+          <p className="mt-5 max-w-lg font-mono-x text-[10px] leading-relaxed tracking-[0.08em] text-[var(--faint)]">
+            隐私说明：玩家在真人或 AI 对局中的表达只有在通过安全过滤，
+            并被多个独立来源重复后，才会送至所配置的 AI
+            服务并进入隔离审核区；达到评分门槛且经所有者批准后，才可能用于改进
+            AI。达到重复门槛前只保存不可逆指纹，不保存聊天原文。
+          </p>
+
           <div className="mt-12">
             <button
               onClick={onStart}

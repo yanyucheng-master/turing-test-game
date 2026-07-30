@@ -11,26 +11,15 @@ import { generateOpponentTurn, pickOpeningLine } from "./generateTurn";
 import { afterAiReply, beginSilentMatch, holdDelayedOpener } from "./proactive";
 import { fallbackOpener } from "./personas";
 import { nextRng } from "./rng";
+import {
+  clearReplySkipState,
+  decideReplyToPlayer,
+  hasPendingAssistant,
+  onSkipReply,
+  unansweredPlayerText,
+} from "./replyGate";
 
 const BURST_MS = 350;
-
-function unansweredPlayerText(session: GameSession): string {
-  const visible = session.transcript
-    .filter((e) => e.state === "visible")
-    .sort((a, b) => a.occurredAt - b.occurredAt);
-  let lastAssistant = -1;
-  for (let i = visible.length - 1; i >= 0; i--) {
-    if (visible[i].role === "assistant") {
-      lastAssistant = i;
-      break;
-    }
-  }
-  return visible
-    .slice(lastAssistant + 1)
-    .filter((e) => e.role === "user")
-    .map((e) => e.text)
-    .join("\n");
-}
 
 function snapshotMemory(session: GameSession) {
   return structuredClone(session.memory);
@@ -88,6 +77,7 @@ function pumpQueue(gameId: string): void {
         }
       }
       if (scheduled) {
+        clearReplySkipState(again);
         afterAiReply(again);
       }
       committed = true;
@@ -118,8 +108,48 @@ function flushPlayerBurst(gameId: string): void {
   session.pendingPlayerBurst = [];
   const combined = unansweredPlayerText(session);
   if (!combined.trim()) return;
+
+  const decision = decideReplyToPlayer(session);
+  if (decision === "busy") return;
+  if (decision === "skip") {
+    onSkipReply(session);
+    return;
+  }
+
+  // Keep skippedReplyStreak until delivery succeeds (see pumpQueue).
+  session.deferredReplyAt = null;
   session.aiReplyQueue = [combined];
   pumpQueue(gameId);
+}
+
+/**
+ * Late reply after a skip — called from the events / nudge poll loop.
+ */
+export function flushDeferredAiReply(session: GameSession): void {
+  if (session.mode !== "ai") return;
+  if (!session.deferredReplyAt || Date.now() < session.deferredReplyAt) return;
+  if (isChatClosed(session) || session.myGuess || session.aiJudgedAt) {
+    session.deferredReplyAt = null;
+    return;
+  }
+  // Busy: retry soon instead of dropping the deferred reply.
+  if (
+    session.aiJobPending ||
+    session.burstTimer ||
+    session.aiReplyQueue.length ||
+    hasPendingAssistant(session)
+  ) {
+    session.deferredReplyAt = Date.now() + 450;
+    return;
+  }
+  const combined = unansweredPlayerText(session);
+  if (!combined.trim()) {
+    session.deferredReplyAt = null;
+    return;
+  }
+  session.deferredReplyAt = null;
+  session.aiReplyQueue = [combined];
+  pumpQueue(session.id);
 }
 
 /**
@@ -136,6 +166,7 @@ export function queueAiGeneration(
   appendUserTranscript(session, playerText);
   cancelPendingAssistant(session);
   session.aiReplyQueue = [];
+  session.deferredReplyAt = null;
   session.pendingPlayerBurst.push(playerText);
 
   if (session.burstTimer) clearTimeout(session.burstTimer);
@@ -157,6 +188,10 @@ export function queueOpeningTurn(
   try {
     const live = getSession(gameId);
     if (!live || live.mode !== "ai" || isChatClosed(live)) return;
+    if (live.neverSpeakFirst) {
+      beginSilentMatch(live);
+      return;
+    }
     if (live.lastPlayerActivityAt > 0 || live.playerCount > 0) return;
 
     const opener = pickOpeningLine(live);
@@ -176,7 +211,8 @@ export function queueOpeningTurn(
       !isChatClosed(again) &&
       again.playerCount === 0 &&
       !again.pendingOpener &&
-      again.opponentCount === 0
+      again.opponentCount === 0 &&
+      !again.neverSpeakFirst
     ) {
       holdDelayedOpener(again, fallbackOpener(again.persona), 400);
     }
@@ -188,7 +224,7 @@ export function startClaimedOpening(session: GameSession): void {
   if (session.mode !== "ai" || session.openerStarted) return;
   const style = session.pendingOpenStyle ?? "immediate";
   session.pendingOpenStyle = null;
-  if (style === "wait") {
+  if (style === "wait" || session.neverSpeakFirst) {
     session.openerStarted = true;
     beginSilentMatch(session);
     return;

@@ -43,7 +43,9 @@ export function describeEnvironment(session: GameSession): string[] {
 
   if (state.remainingMs < 25_000) notes.push("对话时间已经不多");
   if (state.accusationCount >= 2) notes.push("对方已经连续质疑你的身份");
-  if (state.silenceDurationMs > 15_000) notes.push("刚才出现了一段明显沉默");
+  if (state.silenceDurationMs > INITIAL_CONFIG.proactiveMinSilenceMs) {
+    notes.push("刚才出现了一段明显沉默");
+  }
   if (state.conversationIntensity === "high") notes.push("聊得比较密");
 
   // Soft meta allowance — planner may use at most N times via flag.

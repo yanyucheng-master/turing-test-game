@@ -20,5 +20,5 @@
       "@db/*": ["./db/*"]
     }
   },
-  "include": ["api", "contracts", "db"]
+  "include": ["api", "admin/localServer.ts", "admin/security.ts", "contracts", "db"]
 }

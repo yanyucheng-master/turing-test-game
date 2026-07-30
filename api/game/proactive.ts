@@ -17,6 +17,13 @@ function pick(pool: string[]): string {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+/** First-contact hello is allowed once even when followUpMax is 0. */
+function nudgeBudget(session: GameSession, firstContact: boolean): number {
+  const persona = getSocialPersona(session.socialPersonaId);
+  if (firstContact) return Math.max(1, persona.tempo.followUpMax);
+  return persona.tempo.followUpMax;
+}
+
 export function scheduleProactiveNudge(
   session: GameSession,
   opts?: { firstContact?: boolean },
@@ -27,8 +34,19 @@ export function scheduleProactiveNudge(
     return;
   }
 
-  const persona = getSocialPersona(session.socialPersonaId);
-  const maxNudge = persona.tempo.followUpMax;
+  const first = opts?.firstContact || session.opponentCount === 0;
+  // May never speak first — silence forever until the player talks.
+  if (first && session.neverSpeakFirst) {
+    session.nextNudgeAt = null;
+    return;
+  }
+  // Player already spoke (and we may have ignored them) — don't drop a bare「嗨」.
+  if (first && session.lastPlayerActivityAt > 0) {
+    session.nextNudgeAt = null;
+    return;
+  }
+
+  const maxNudge = nudgeBudget(session, first);
   if (maxNudge <= 0) {
     session.nextNudgeAt = null;
     return;
@@ -38,10 +56,10 @@ export function scheduleProactiveNudge(
     return;
   }
 
-  const first = opts?.firstContact || session.opponentCount === 0;
   const minSilence = INITIAL_CONFIG.proactiveMinSilenceMs;
+  // First contact: ~10–18s mutual silence floor; later: ~10–20s.
   const delay = first
-    ? minSilence + Math.random() * 13_000
+    ? minSilence + Math.random() * 8_000
     : minSilence + Math.random() * 10_000;
   session.nextNudgeAt = Date.now() + delay;
 }
@@ -128,8 +146,19 @@ export function maybeProactiveNudge(session: GameSession): void {
     return;
   }
 
+  const firstContact = session.opponentCount === 0;
+  if (firstContact && session.neverSpeakFirst) {
+    session.nextNudgeAt = null;
+    return;
+  }
+  if (firstContact && session.lastPlayerActivityAt > 0) {
+    session.nextNudgeAt = null;
+    return;
+  }
+
   const persona = getSocialPersona(session.socialPersonaId);
-  if (session.nudgeCount >= persona.tempo.followUpMax) {
+  const maxNudge = nudgeBudget(session, firstContact);
+  if (session.nudgeCount >= maxNudge) {
     session.nextNudgeAt = null;
     return;
   }
@@ -155,7 +184,6 @@ export function maybeProactiveNudge(session: GameSession): void {
     return;
   }
 
-  const firstContact = session.opponentCount === 0;
   let line: string;
   if (firstContact) {
     line = scrubReply(pick(HELLO_LINES)) || "嗨";
@@ -211,7 +239,7 @@ export function maybeProactiveNudge(session: GameSession): void {
     session.inputRevision,
   );
 
-  if (session.nudgeCount < persona.tempo.followUpMax && Math.random() < 0.35) {
+  if (session.nudgeCount < maxNudge && Math.random() < 0.35) {
     scheduleProactiveNudge(session);
   } else {
     session.nextNudgeAt = null;

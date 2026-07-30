@@ -26,7 +26,7 @@ import {
   acceptMatch,
   ensureClaimedByGameId,
 } from "./matchmaking";
-import { queueAiGeneration } from "./aiWorker";
+import { queueAiGeneration, flushDeferredAiReply } from "./aiWorker";
 import {
   computeStats,
   maybeTriggerAiEarlyJudge,
@@ -41,6 +41,7 @@ import {
   closeChatIfExpired,
 } from "./settle";
 import { onPlayerActivity, maybeProactiveNudge } from "./proactive";
+import { observeCulturePhrase, observeCultureReaction } from "./cultureMemory";
 import {
   canRegisterActiveGame,
   checkRateLimit,
@@ -53,7 +54,7 @@ function assertRate(
   ip: string,
   action: string,
   limit: number,
-  windowMs: number,
+  windowMs: number
 ) {
   if (!checkRateLimit(`${ip}:${action}`, limit, windowMs)) {
     throw new TRPCError({
@@ -123,7 +124,7 @@ export const gameRouter = createRouter({
       z.object({
         gameId: z.string(),
         text: z.string().trim().min(1).max(500),
-      }),
+      })
     )
     .mutation(async ({ ctx, input }): Promise<ChatResult> => {
       const ip = clientIp(ctx.req);
@@ -172,6 +173,13 @@ export const gameRouter = createRouter({
       session.playerCount += 1;
       onPlayerActivity(session);
 
+      // Player-side text from both PVP and AI matches is eligible for the same
+      // strict learning gate. Candidate observations retain only a one-way
+      // fingerprint until three independent sources repeat the phrase.
+      void observeCulturePhrase({ sourceId: ip, text }).catch(error => {
+        console.error("[culture-memory] observe phrase failed:", error);
+      });
+
       if (session.mode === "pvp") {
         const room = session.roomId ? getRoom(session.roomId) : undefined;
         if (!room || !session.seat) {
@@ -181,7 +189,17 @@ export const gameRouter = createRouter({
         if (room.left[other]) {
           return { ok: false, sessionLost: true };
         }
+        const previous = room.messages.at(-1);
         room.messages.push({ seat: session.seat, text, at: Date.now() });
+        if (previous && previous.seat !== session.seat) {
+          void observeCultureReaction({
+            sourceId: ip,
+            trigger: previous.text,
+            response: text,
+          }).catch(error => {
+            console.error("[culture-memory] observe reaction failed:", error);
+          });
+        }
         const peer = getSession(room.seats[other]);
         if (peer && !isChatClosed(peer)) {
           // Immediate delivery — delayed outbox is wiped by closeConversation.
@@ -189,6 +207,23 @@ export const gameRouter = createRouter({
           peer.opponentCount += 1;
         }
       } else {
+        const previousAiLine = [...session.transcript]
+          .reverse()
+          .find(
+            event => event.role === "assistant" && event.state === "visible"
+          );
+        if (previousAiLine) {
+          void observeCultureReaction({
+            sourceId: ip,
+            trigger: previousAiLine.text,
+            response: text,
+          }).catch(error => {
+            console.error(
+              "[culture-memory] observe AI-game reaction failed:",
+              error
+            );
+          });
+        }
         maybeTriggerAiEarlyJudge(session);
         if (!(session.aiJudgedAt && !session.myGuess)) {
           queueAiGeneration(session, text);
@@ -216,7 +251,7 @@ export const gameRouter = createRouter({
       z.object({
         gameId: z.string(),
         cursor: z.number().int().min(0).default(0),
-      }),
+      })
     )
     .mutation(async ({ ctx, input }): Promise<EventPullResult> => {
       const ip = clientIp(ctx.req);
@@ -277,15 +312,14 @@ export const gameRouter = createRouter({
       }
 
       maybeTriggerAiEarlyJudge(live);
+      flushDeferredAiReply(live);
       maybeProactiveNudge(live);
 
       const expired = closeChatIfExpired(live);
 
       const events = peekDueEvents(live, input.cursor);
       const cursor =
-        events.length > 0
-          ? events[events.length - 1].seq
-          : input.cursor;
+        events.length > 0 ? events[events.length - 1].seq : input.cursor;
 
       if (live.waitingForOpponent) {
         return {
@@ -316,7 +350,7 @@ export const gameRouter = createRouter({
       z.object({
         gameId: z.string(),
         guess: z.enum(["human", "ai"]),
-      }),
+      })
     )
     .mutation(async ({ ctx, input }): Promise<FinishResult> => {
       const ip = clientIp(ctx.req);

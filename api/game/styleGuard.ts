@@ -1,9 +1,13 @@
 import { INITIAL_CONFIG } from "./config";
 import { scrubReply } from "./personas";
-import type { TurnPlan } from "./turnPolicy";
+import { isSpillPlan, type TurnPlan } from "./turnPolicy";
 
 /** Strip assistant-ese locally so we can avoid a second LLM rewrite. */
-export function compressAssistantese(parts: string[]): string[] {
+export function compressAssistantese(
+  parts: string[],
+  opts?: { aggressive?: boolean },
+): string[] {
+  const aggressive = opts?.aggressive !== false;
   const cutLead =
     /^(我理解你的感受[，,]?|听起来你可能是在|这可能意味着|从某种意义上说|需要注意的是|总的来说[，,]?)/;
   const cutExplain =
@@ -13,8 +17,8 @@ export function compressAssistantese(parts: string[]): string[] {
     .map((p) => {
       let t = p.trim();
       t = t.replace(cutLead, "");
-      // Keep first clause when the model starts explaining.
-      if (t.length > 18 && /[，,。；;]/.test(t)) {
+      // Keep first clause when the model starts explaining (short replies only).
+      if (aggressive && t.length > 18 && /[，,。；;]/.test(t)) {
         const first = t.split(/[，,。；;]/)[0]?.trim();
         if (first && first.length >= 2) t = first;
       }
@@ -89,6 +93,13 @@ export function runStyleGuard(
 ): StyleGuardResult {
   const reasons: string[] = [];
   let severity: StyleGuardResult["severity"] = "low";
+  const spill = isSpillPlan(plan);
+  const maxPart = spill
+    ? INITIAL_CONFIG.maxSpillPartLength
+    : INITIAL_CONFIG.maxPartLength;
+  const maxTotal = spill
+    ? INITIAL_CONFIG.maxSpillTotalLength
+    : INITIAL_CONFIG.maxTotalLength;
 
   // Hard-fail on raw model text BEFORE scrubReply can rewrite identity slips
   // into canned denials (which would falsely look "safe").
@@ -101,6 +112,7 @@ export function runStyleGuard(
 
   let cleaned = compressAssistantese(
     parts.map((p) => scrubReply(p)).map((p) => p.trim()).filter(Boolean),
+    { aggressive: !spill },
   );
 
   if (plan.strategy === "react_only" || plan.targetLength === "tiny") {
@@ -116,21 +128,21 @@ export function runStyleGuard(
   }
 
   cleaned = cleaned.map((p) => {
-    if (p.length > INITIAL_CONFIG.maxPartLength) {
+    if (p.length > maxPart) {
       reasons.push("part_too_long");
       severity = "medium";
-      return p.slice(0, INITIAL_CONFIG.maxPartLength);
+      return p.slice(0, maxPart);
     }
     return p;
   });
 
   const total = cleaned.join("").length;
-  if (total > INITIAL_CONFIG.maxTotalLength) {
+  if (total > maxTotal) {
     reasons.push("total_too_long");
-    severity = "high";
+    severity = spill ? "medium" : "high";
     // Prefer drop second part over hard mid-cut of first.
     if (cleaned.length > 1) cleaned = [cleaned[0]];
-    else cleaned = [cleaned[0].slice(0, INITIAL_CONFIG.maxTotalLength)];
+    else cleaned = [cleaned[0].slice(0, maxTotal)];
   }
 
   for (const p of cleaned) {

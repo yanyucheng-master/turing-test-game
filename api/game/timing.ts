@@ -47,12 +47,18 @@ export function calculateReplyDelay(input: {
   const patience = input.session?.memory.interaction.patience ?? 0.5;
   const hesitation = patience < 0.3 ? 200 + rng() * 400 : rng() * 200;
   const jitter = rng() * 450;
+  const spillExtra =
+    input.plan.strategy === "spill" || input.plan.targetLength === "long"
+      ? 400 + rng() * 900
+      : 0;
 
   return Math.round(
     clamp(
-      readingDelay + typingDelay + interpretationPause + hesitation + jitter,
+      readingDelay + typingDelay + interpretationPause + hesitation + jitter + spillExtra,
       INITIAL_CONFIG.minDelayMs,
-      INITIAL_CONFIG.maxDelayMs,
+      input.plan.strategy === "spill" || input.plan.targetLength === "long"
+        ? Math.max(INITIAL_CONFIG.maxDelayMs, 9_000)
+        : INITIAL_CONFIG.maxDelayMs,
     ),
   );
 }

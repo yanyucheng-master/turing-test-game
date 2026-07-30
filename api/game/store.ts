@@ -143,6 +143,14 @@ export interface GameSession {
   /** Opening style chosen at match commit; generated only after claim. */
   pendingOpenStyle: "immediate" | "delayed" | "wait" | null;
   openerStarted: boolean;
+  /** Never send opener / first-contact nudge (may still reply to player). */
+  neverSpeakFirst: boolean;
+  /** Skip any reaction to the player's first message. */
+  ignoreFirstPlayerMsg: boolean;
+  /** Epoch ms to optionally reply to unanswered player text after a skip. */
+  deferredReplyAt: number | null;
+  /** Consecutive skipped reply decisions (reset on reply). */
+  skippedReplyStreak: number;
 
   /** Unified delivery queue (AI + PvP peer messages). */
   outbox: OutboxItem[];
@@ -597,6 +605,10 @@ export function createAiSession(
     delayedOpenerAt: null,
     pendingOpenStyle: null,
     openerStarted: false,
+    neverSpeakFirst: false,
+    ignoreFirstPlayerMsg: false,
+    deferredReplyAt: null,
+    skippedReplyStreak: 0,
     outbox: [],
     outboxSeq: 0,
     lastScheduledDeliveryAt: 0,
@@ -685,6 +697,10 @@ export function createPvpPair(
     delayedOpenerAt: null as number | null,
     pendingOpenStyle: null as "immediate" | "delayed" | "wait" | null,
     openerStarted: false,
+    neverSpeakFirst: false,
+    ignoreFirstPlayerMsg: false,
+    deferredReplyAt: null as number | null,
+    skippedReplyStreak: 0,
     outbox: [] as OutboxItem[],
     outboxSeq: 0,
     lastScheduledDeliveryAt: 0,

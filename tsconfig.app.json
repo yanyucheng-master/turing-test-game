@@ -40,6 +40,7 @@
     "noUncheckedSideEffectImports": true
   },
   "include": [
-    "src"
+    "src",
+    "admin/main.tsx"
   ]
 }

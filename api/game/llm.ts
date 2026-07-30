@@ -93,6 +93,8 @@ interface CallOptions {
   temperature?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Optional per-call model override, used by the isolated culture reviewer. */
+  model?: string;
 }
 
 function redactSecrets(text: string): string {
@@ -161,7 +163,7 @@ function openAiBody(
   opts: CallOptions,
 ) {
   const body: Record<string, unknown> = {
-    model: AI_MODEL,
+    model: opts.model || AI_MODEL,
     messages: [{ role: "system", content: system }, ...history],
     max_tokens: opts.maxTokens ?? 150,
     temperature: opts.temperature ?? 0.9,
@@ -198,7 +200,7 @@ async function tryAnthropic(
   opts: CallOptions,
 ): Promise<string | null> {
   const body: Record<string, unknown> = {
-    model: AI_MODEL,
+    model: opts.model || AI_MODEL,
     system,
     messages: history,
     max_tokens: opts.maxTokens ?? 150,

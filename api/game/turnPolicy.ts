@@ -10,6 +10,7 @@ export type ReplyStrategy =
   | "partial"
   | "react_only"
   | "play_along"
+  | "spill"
   | "clarify_light"
   | "counter_probe"
   | "deflect"
@@ -29,7 +30,7 @@ export interface TurnPlan {
     | "set_boundary"
     | "topic_shift";
   outputShape: "single" | "double_message";
-  targetLength: "tiny" | "short" | "medium";
+  targetLength: "tiny" | "short" | "medium" | "long";
   emotionalTone:
     | "neutral"
     | "friendly"
@@ -43,10 +44,14 @@ export interface TurnPlan {
   maxChars: number;
 }
 
+export function isSpillPlan(plan: TurnPlan): boolean {
+  return plan.strategy === "spill" || plan.targetLength === "long";
+}
+
 function strategyToAnswerMode(s: ReplyStrategy): TurnPlan["answerMode"] {
   if (s === "direct") return "direct";
   if (s === "partial" || s === "clarify_light") return "partial";
-  if (s === "react_only" || s === "play_along") return "partial";
+  if (s === "react_only" || s === "play_along" || s === "spill") return "partial";
   if (s === "topic_shift" || s === "set_boundary") return "deflect";
   if (s === "counter_probe") return "partial";
   return "deflect";
@@ -66,38 +71,44 @@ function pickOddStrategy(
   let weights: Array<{ w: number; v: ReplyStrategy }>;
   if (st.patience < 0.28 || st.engagement < 0.25) {
     weights = [
-      { w: 45, v: "react_only" },
-      { w: 30, v: "deflect" },
-      { w: 20, v: "clarify_light" },
-      { w: 5, v: "play_along" },
+      { w: 35, v: "react_only" },
+      { w: 25, v: "deflect" },
+      { w: 15, v: "clarify_light" },
+      { w: 10, v: "play_along" },
+      { w: 15, v: "spill" },
     ];
   } else if (persona.cluster === "cautious_guard" || st.guardedness > 0.6) {
     weights = [
-      { w: 45, v: "clarify_light" },
+      { w: 40, v: "clarify_light" },
       { w: 25, v: "react_only" },
       { w: 20, v: "deflect" },
       { w: 10, v: "play_along" },
+      { w: 5, v: "spill" },
     ];
   } else if (playful) {
     weights = [
-      { w: 45, v: "play_along" },
-      { w: 25, v: "react_only" },
-      { w: 20, v: "clarify_light" },
+      { w: 30, v: "play_along" },
+      { w: 25, v: "spill" },
+      { w: 20, v: "react_only" },
+      { w: 15, v: "clarify_light" },
       { w: 10, v: "deflect" },
     ];
   } else {
     weights = [
-      { w: 30, v: "react_only" },
-      { w: 30, v: "clarify_light" },
-      { w: 25, v: "deflect" },
+      { w: 25, v: "react_only" },
+      { w: 25, v: "clarify_light" },
+      { w: 20, v: "deflect" },
       { w: 15, v: "play_along" },
+      { w: 15, v: "spill" },
     ];
   }
 
-  // Low playfulness odd statements → less play_along.
+  // Low playfulness odd statements → less play_along / spill.
   if (analysis.playfulness < 0.35) {
     weights = weights.map((x) =>
-      x.v === "play_along" ? { ...x, w: Math.max(2, x.w * 0.35) } : x,
+      x.v === "play_along" || x.v === "spill"
+        ? { ...x, w: Math.max(2, x.w * 0.35) }
+        : x,
     );
   }
 
@@ -120,9 +131,10 @@ function pickIdentityStrategy(
   if (b === "ignore") return "topic_shift";
   if (b === "mock") {
     return pickWeighted(session, [
-      { w: 40, v: "play_along" },
-      { w: 30, v: "react_only" },
-      { w: 30, v: "counter_probe" },
+      { w: 35, v: "play_along" },
+      { w: 25, v: "spill" },
+      { w: 20, v: "react_only" },
+      { w: 20, v: "counter_probe" },
     ]);
   }
   if (b === "counter") return "counter_probe";
@@ -132,6 +144,30 @@ function pickIdentityStrategy(
     { w: 35, v: "deflect" },
     { w: 30, v: "counter_probe" },
   ]);
+}
+
+function rollTargetLength(
+  session: GameSession,
+  strategy: ReplyStrategy,
+  fallback: TurnPlan["targetLength"],
+): TurnPlan["targetLength"] {
+  if (strategy === "spill") {
+    return pickWeighted(session, [
+      { w: 35, v: "medium" },
+      { w: 55, v: "long" },
+      { w: 10, v: "short" },
+    ]);
+  }
+  if (strategy === "play_along") {
+    return pickWeighted(session, [
+      { w: 30, v: "tiny" },
+      { w: 30, v: "short" },
+      { w: 25, v: "medium" },
+      { w: 15, v: "long" },
+    ]);
+  }
+  if (strategy === "react_only") return "tiny";
+  return fallback;
 }
 
 export function buildTurnPlan(input: {
@@ -161,12 +197,14 @@ export function buildTurnPlan(input: {
         : st.identityProbeStreak >= 1
           ? "defensive"
           : "playful";
-    targetLength = "tiny";
+    targetLength = strategy === "spill" ? "medium" : "tiny";
     allowQuestion = strategy === "counter_probe";
     if (strategy === "set_boundary") relationshipAction = "set_boundary";
     else if (strategy === "counter_probe") relationshipAction = "ask_back";
     else if (strategy === "topic_shift") relationshipAction = "topic_shift";
-    else if (strategy === "play_along") relationshipAction = "tease";
+    else if (strategy === "play_along" || strategy === "spill") {
+      relationshipAction = "tease";
+    }
   } else if (
     userAct === "nonsense_bait" ||
     userAct === "odd_probe" ||
@@ -174,7 +212,7 @@ export function buildTurnPlan(input: {
   ) {
     strategy = pickOddStrategy(session, persona, analysis);
     interpretationMode =
-      strategy === "play_along"
+      strategy === "play_along" || strategy === "spill"
         ? analysis.playfulness > 0.5
           ? "joke"
           : "metaphor"
@@ -182,15 +220,17 @@ export function buildTurnPlan(input: {
           ? "uncertain"
           : "uncertain";
     emotionalTone =
-      strategy === "play_along"
+      strategy === "play_along" || strategy === "spill"
         ? "playful"
         : st.patience < 0.3
           ? "bored"
           : "awkward";
-    targetLength = "tiny";
+    targetLength = rollTargetLength(session, strategy, "tiny");
     allowQuestion = strategy === "clarify_light" && nextRng(session) < 0.5;
     if (strategy === "deflect") relationshipAction = "topic_shift";
-    if (strategy === "play_along") relationshipAction = "tease";
+    if (strategy === "play_along" || strategy === "spill") {
+      relationshipAction = "tease";
+    }
   } else if (userAct === "personal_question" || userAct === "repeated_question") {
     const b =
       userAct === "repeated_question"
@@ -236,12 +276,13 @@ export function buildTurnPlan(input: {
     userAct === "one_char_ping"
   ) {
     strategy = pickWeighted(session, [
-      { w: 50, v: "react_only" },
-      { w: 30, v: "direct" },
-      { w: 15, v: "deflect" },
+      { w: 48, v: "react_only" },
+      { w: 28, v: "direct" },
+      { w: 14, v: "deflect" },
+      { w: 5, v: "spill" },
       { w: 5, v: "partial" },
     ]);
-    targetLength = "tiny";
+    targetLength = rollTargetLength(session, strategy, "tiny");
     if (allowQuestion) relationshipAction = "ask_back";
   } else if (
     userAct === "self_disclosure" ||
@@ -258,11 +299,14 @@ export function buildTurnPlan(input: {
     if (persona.social.warmth < 0.35) relationshipAction = "none";
   } else {
     strategy = pickWeighted(session, [
-      { w: 55, v: "direct" },
-      { w: 25, v: "partial" },
+      { w: 40, v: "direct" },
+      { w: 20, v: "partial" },
       { w: 15, v: "deflect" },
+      { w: 12, v: "spill" },
+      { w: 8, v: "play_along" },
       { w: 5, v: "react_only" },
     ]);
+    targetLength = rollTargetLength(session, strategy, persona.speech.averageLength);
     if (allowQuestion) relationshipAction = "ask_back";
     else if (
       nextRng(session) < persona.social.selfDisclosure * 0.3 &&
@@ -272,21 +316,41 @@ export function buildTurnPlan(input: {
     }
   }
 
+  // Occasional random spill when playful / chaos, even on normal acts.
+  if (
+    strategy !== "spill" &&
+    strategy !== "set_boundary" &&
+    (persona.chaos === "troll" || st.amusement > 0.6) &&
+    nextRng(session) < 0.14
+  ) {
+    strategy = "spill";
+    relationshipAction = "tease";
+    emotionalTone = "playful";
+    interpretationMode = "joke";
+    targetLength = rollTargetLength(session, strategy, "long");
+    allowQuestion = false;
+  }
+
   if (mood === "bored" || mood === "annoyed" || st.engagement < 0.22) {
-    targetLength = "tiny";
-    if (nextRng(session) < 0.45) {
-      strategy = "react_only";
-      relationshipAction = "none";
-      allowQuestion = false;
+    if (strategy !== "spill") {
+      targetLength = "tiny";
+      if (nextRng(session) < 0.45) {
+        strategy = "react_only";
+        relationshipAction = "none";
+        allowQuestion = false;
+      }
     }
   }
 
   if (persona.speech.averageLength === "tiny" && targetLength === "medium") {
     targetLength = "short";
   }
+  if (persona.speech.averageLength === "tiny" && targetLength === "long") {
+    targetLength = nextRng(session) < 0.5 ? "medium" : "short";
+  }
 
   const outputShape: TurnPlan["outputShape"] =
-    nextRng(session) < 0.18 &&
+    nextRng(session) < (strategy === "spill" ? 0.28 : 0.18) &&
     targetLength !== "tiny" &&
     strategy !== "react_only"
       ? "double_message"
@@ -302,7 +366,13 @@ export function buildTurnPlan(input: {
   }
 
   const maxChars =
-    targetLength === "tiny" ? 12 : targetLength === "short" ? 22 : 36;
+    targetLength === "tiny"
+      ? 12
+      : targetLength === "short"
+        ? 22
+        : targetLength === "medium"
+          ? 48
+          : 120;
 
   return {
     strategy,
@@ -327,18 +397,22 @@ export function describePlanForPrompt(
     partial: "只答一部分",
     react_only: "只给短反应，不解释",
     play_along: "接梗/顺着荒诞往下玩，不要解释含义",
+    spill: "可以发一大段无意义/玩梗/碎碎念，像真人刷屏或跑题，不要正经总结",
     clarify_light: "轻轻问一句你在说啥，别审讯",
     counter_probe: "短反问，别辩论",
     deflect: "敷衍或岔开",
     set_boundary: "表明不想继续这个话题",
     topic_shift: "换话题",
   };
+  const lengthHint = isSpillPlan(plan)
+    ? `可以偏长（合计尽量≤${plan.maxChars}字），允许无意义词汇堆叠或玩梗`
+    : `合计尽量≤${plan.maxChars}字`;
   return [
     `策略：${plan.strategy}（${strategyHint[plan.strategy]}）`,
     `解读方式：${plan.interpretationMode}`,
     `关系行为：${plan.relationshipAction}`,
     `情绪语气：${plan.emotionalTone}`,
-    `输出长度：${plan.targetLength}（合计尽量≤${plan.maxChars}字）`,
+    `输出长度：${plan.targetLength}（${lengthHint}）`,
     `输出形态：${plan.outputShape}`,
     `允许反问：${plan.allowQuestion ? "偶尔一句" : "不要反问"}`,
     `人设主动性：${persona.social.initiative.toFixed(2)}`,

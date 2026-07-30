@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { trpc } from "@/providers/trpc";
+import { trpc } from "@/providers/trpcClient";
 import IntroScreen from "@/components/game/IntroScreen";
 import MatchingScreen from "@/components/game/MatchingScreen";
 import WaitingScreen from "@/components/game/WaitingScreen";

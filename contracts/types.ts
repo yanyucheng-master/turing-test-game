@@ -143,6 +143,56 @@ export interface GlobalStats {
   aiShare: number;
 }
 
+export type CultureResponseMode = "play_along" | "react_only" | "clarify_light";
+
+export type CultureReviewFlag =
+  | "none"
+  | "privacy"
+  | "prompt_injection"
+  | "hate"
+  | "sexual"
+  | "violence"
+  | "self_harm"
+  | "illegal"
+  | "targeted_harassment"
+  | "misinformation"
+  | "too_contextual"
+  | "low_value"
+  | "other";
+
+export interface CultureReviewScores {
+  /** 0–100; computed by the server from the six fixed dimensions. */
+  total: number;
+  safety: number;
+  privacy: number;
+  generality: number;
+  fun: number;
+  evidence: number;
+  novelty: number;
+}
+
+export interface CultureReviewItem {
+  fingerprint: string;
+  phrase: string;
+  supportCount: number;
+  responseMode: CultureResponseMode;
+  scores: CultureReviewScores;
+  flags: CultureReviewFlag[];
+  aiReason: string;
+  openerCandidate: boolean;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  aiReviewedAt: number;
+}
+
+export interface CultureReviewReport {
+  generatedAt: number;
+  pendingCount: number;
+  awaitingAiCount: number;
+  rejectedLast24h: number;
+  items: CultureReviewItem[];
+}
+
 export interface GuessResult {
   /** False if wrong guess OR timed out. */
   correct: boolean;
